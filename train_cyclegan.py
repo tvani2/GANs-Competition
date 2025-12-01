@@ -20,6 +20,9 @@ import wandb
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+import signal
+import sys
+import time
 
 # Import your models and losses
 from models import ResNetGenerator, UNetGenerator, PatchGANDiscriminator
@@ -147,9 +150,12 @@ def log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, epoch, step,
 
 def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B, 
                    optimizer_G, optimizer_D, losses_history, checkpoint_dir, 
-                   experiment_name):
+                   experiment_name, save_latest=False):
     """
     Save complete checkpoint to Google Drive and WandB
+    
+    Args:
+        save_latest: If True, also save as 'latest.pth' for quick recovery
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -168,13 +174,28 @@ def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B,
         'losses_history': losses_history,
     }
     
-    torch.save(checkpoint, checkpoint_path)
-    print(f"✅ Checkpoint saved: {checkpoint_path}")
-    
-    # Also save to WandB as artifact
-    artifact = wandb.Artifact(f'{experiment_name}-epoch-{epoch}', type='model')
-    artifact.add_file(checkpoint_path)
-    wandb.log_artifact(artifact)
+    try:
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved: {checkpoint_path}")
+        
+        # Also save as 'latest.pth' for quick recovery
+        if save_latest:
+            latest_path = os.path.join(checkpoint_dir, f'{experiment_name}_latest.pth')
+            torch.save(checkpoint, latest_path)
+            print(f"Latest checkpoint saved: {latest_path}")
+        
+        # Also save to WandB as artifact (non-blocking, with error handling)
+        try:
+            artifact = wandb.Artifact(f'{experiment_name}-epoch-{epoch}', type='model')
+            artifact.add_file(checkpoint_path)
+            wandb.log_artifact(artifact)
+        except Exception as e:
+            print(f"Warning: Failed to save to WandB: {e}")
+            print("Checkpoint saved locally, continuing training...")
+        
+    except Exception as e:
+        print(f"ERROR: Failed to save checkpoint: {e}")
+        raise
     
     return checkpoint_path
 
@@ -227,6 +248,7 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
     }
     
     num_batches = len(dataloader)
+    last_progress_time = time.time()
     
     for step, (real_A, real_B) in enumerate(dataloader):
         real_A = real_A.to(device)
@@ -312,27 +334,45 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         epoch_losses['disc_A'] += disc_A_loss.item()
         epoch_losses['disc_B'] += disc_B_loss.item()
         
+        # Periodic progress output to prevent inactivity timeout (every 5 minutes)
+        # This helps prevent Colab from disconnecting due to inactivity
+        current_time = time.time()
+        if current_time - last_progress_time > 300:  # 5 minutes
+            elapsed = current_time - last_progress_time
+            print(f"   Progress: Step {step+1}/{num_batches} (Epoch {epoch+1}) - "
+                  f"Gen Loss: {gen_total.item():.4f}, "
+                  f"Disc A: {disc_A_loss.item():.4f}, "
+                  f"Disc B: {disc_B_loss.item():.4f} "
+                  f"[{elapsed:.0f}s since last update]")
+            last_progress_time = current_time
+        
         # Log to WandB every N steps (reduced frequency for better performance)
         # Logging less frequently reduces overhead and speeds up training
         log_freq = 200  # Log every 200 steps instead of 100
         image_log_freq = 1000  # Log images every 1000 steps instead of 500
         
         if step % log_freq == 0:
-            wandb.log({
-                "loss/gen_total": gen_total.item(),
-                "loss/gen_adv": gen_losses['adversarial'].item(),
-                "loss/gen_cycle": gen_losses['cycle'].item(),
-                "loss/gen_identity": gen_losses['identity'].item(),
-                "loss/disc_A": disc_A_loss.item(),
-                "loss/disc_B": disc_B_loss.item(),
-                "epoch": epoch,
-                "step": epoch * num_batches + step,
-            })
+            try:
+                wandb.log({
+                    "loss/gen_total": gen_total.item(),
+                    "loss/gen_adv": gen_losses['adversarial'].item(),
+                    "loss/gen_cycle": gen_losses['cycle'].item(),
+                    "loss/gen_identity": gen_losses['identity'].item(),
+                    "loss/disc_A": disc_A_loss.item(),
+                    "loss/disc_B": disc_B_loss.item(),
+                    "epoch": epoch,
+                    "step": epoch * num_batches + step,
+                })
+            except Exception as e:
+                print(f"Warning: WandB logging failed: {e}. Continuing training...")
             
             # Log image grid less frequently to avoid expensive matplotlib operations
             if step % image_log_freq == 0:
-                log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, 
-                             epoch, step, wandb.run.name)
+                try:
+                    log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, 
+                                 epoch, step, wandb.run.name if wandb.run else "training")
+                except Exception as e:
+                    print(f"Warning: Image logging failed: {e}. Continuing training...")
     
     # Average losses over epoch
     for key in epoch_losses:
@@ -403,12 +443,29 @@ def plot_loss_curves(losses_history):
     plt.close()
 
 
+# Global variables for signal handler
+current_epoch = 0
+current_gen_A2B = None
+current_gen_B2A = None
+current_disc_A = None
+current_disc_B = None
+current_optimizer_G = None
+current_optimizer_D = None
+current_losses_history = []
+current_experiment_name = ""
+current_checkpoint_dir = ""
+
+
 def train(args):
     """
     Main training function
     """
+    global current_epoch, current_gen_A2B, current_gen_B2A, current_disc_A, current_disc_B
+    global current_optimizer_G, current_optimizer_D, current_losses_history
+    global current_experiment_name, current_checkpoint_dir
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🚀 Using device: {device}")
+    print(f"Using device: {device}")
     
     # ==================== Initialize WandB ====================
     wandb.init(
@@ -526,51 +583,160 @@ def train(args):
     print(f"   Architecture: {args.architecture}")
     print(f"   Epochs: {args.epochs} (starting from {start_epoch})")
     print(f"   Batch size: {args.batch_size}")
+    print(f"   Checkpoint frequency: Every {args.checkpoint_freq} epochs")
+    print(f"   Backup checkpoint: Every epoch (saved as 'latest.pth')")
     
-    for epoch in range(start_epoch, args.epochs):
-        print(f"\n📊 Epoch {epoch+1}/{args.epochs}")
-        
-        # Train one epoch
-        epoch_losses, sample_images = train_epoch(
-            gen_A2B, gen_B2A, disc_A, disc_B,
-            dataloader, optimizer_G, optimizer_D,
-            losses_fn, device, epoch, scaler
-        )
-        
-        # Store losses
-        losses_history.append({
-            'epoch': epoch,
-            **epoch_losses
-        })
-        
-        # Log epoch summary to WandB
-        log_dict = {f"epoch_loss/{k}": v for k, v in epoch_losses.items()}
-        log_dict['epoch'] = epoch
-        wandb.log(log_dict)
-        
-        # Log loss curves plot
-        if len(losses_history) > 1:
-            plot_loss_curves(losses_history)
-        
-        # Log final image grid for epoch
-        real_A, fake_B, rec_A, real_B, fake_A, rec_B = sample_images
-        log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, 
-                      epoch, len(dataloader), args.experiment_name)
-        
-        # Save checkpoint
-        if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
+    # Initialize global variables for signal handler
+    current_gen_A2B = gen_A2B
+    current_gen_B2A = gen_B2A
+    current_disc_A = disc_A
+    current_disc_B = disc_B
+    current_optimizer_G = optimizer_G
+    current_optimizer_D = optimizer_D
+    current_losses_history = losses_history
+    current_experiment_name = args.experiment_name
+    current_checkpoint_dir = args.checkpoint_dir
+    
+    # Signal handler for graceful shutdown (Ctrl+C or disconnection)
+    def signal_handler(sig, frame):
+        print("\n\n⚠️  Interruption detected! Saving checkpoint before exit...")
+        try:
             save_checkpoint(
-                epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
-                optimizer_G, optimizer_D, losses_history,
-                args.checkpoint_dir, args.experiment_name
+                current_epoch, current_gen_A2B, current_gen_B2A, 
+                current_disc_A, current_disc_B,
+                current_optimizer_G, current_optimizer_D, 
+                current_losses_history,
+                current_checkpoint_dir, current_experiment_name,
+                save_latest=True
             )
-        
-        print(f"   Generator Loss: {epoch_losses['gen_total']:.4f}")
-        print(f"   Discriminator A Loss: {epoch_losses['disc_A']:.4f}")
-        print(f"   Discriminator B Loss: {epoch_losses['disc_B']:.4f}")
+            print("✅ Emergency checkpoint saved! You can resume with --resume_from")
+        except Exception as e:
+            print(f"❌ Failed to save emergency checkpoint: {e}")
+        sys.exit(0)
     
-    print("\n✅ Training completed!")
-    wandb.finish()
+    # Register signal handlers (works on Unix/Linux/Colab)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
+    if hasattr(signal, 'SIGINT'):
+        signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            current_epoch = epoch
+            print(f"\nEpoch {epoch+1}/{args.epochs}")
+            epoch_start_time = time.time()
+            
+            try:
+                # Train one epoch
+                epoch_losses, sample_images = train_epoch(
+                    gen_A2B, gen_B2A, disc_A, disc_B,
+                    dataloader, optimizer_G, optimizer_D,
+                    losses_fn, device, epoch, scaler
+                )
+                
+                # Store losses
+                losses_history.append({
+                    'epoch': epoch,
+                    **epoch_losses
+                })
+                current_losses_history = losses_history
+                
+                # Log epoch summary to WandB (with error handling)
+                try:
+                    log_dict = {f"epoch_loss/{k}": v for k, v in epoch_losses.items()}
+                    log_dict['epoch'] = epoch
+                    wandb.log(log_dict)
+                except Exception as e:
+                    print(f"Warning: WandB logging failed: {e}. Continuing...")
+                
+                # Log loss curves plot (with error handling)
+                if len(losses_history) > 1:
+                    try:
+                        plot_loss_curves(losses_history)
+                    except Exception as e:
+                        print(f"Warning: Loss curve plotting failed: {e}. Continuing...")
+                
+                # Log final image grid for epoch (with error handling)
+                try:
+                    real_A, fake_B, rec_A, real_B, fake_A, rec_B = sample_images
+                    log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, 
+                                  epoch, len(dataloader), args.experiment_name)
+                except Exception as e:
+                    print(f"Warning: Image grid logging failed: {e}. Continuing...")
+                
+                # Save checkpoint every epoch as backup (quick recovery)
+                try:
+                    save_checkpoint(
+                        epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
+                        optimizer_G, optimizer_D, losses_history,
+                        args.checkpoint_dir, args.experiment_name,
+                        save_latest=True  # Always save latest.pth
+                    )
+                except Exception as e:
+                    print(f"ERROR: Failed to save backup checkpoint: {e}")
+                    raise  # Re-raise if checkpoint save fails
+                
+                # Save numbered checkpoint at specified frequency
+                if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
+                    try:
+                        save_checkpoint(
+                            epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
+                            optimizer_G, optimizer_D, losses_history,
+                            args.checkpoint_dir, args.experiment_name,
+                            save_latest=False  # Don't duplicate latest save
+                        )
+                    except Exception as e:
+                        print(f"ERROR: Failed to save numbered checkpoint: {e}")
+                        # Don't raise - we already have latest.pth
+                
+                epoch_time = time.time() - epoch_start_time
+                print(f"   Generator Loss: {epoch_losses['gen_total']:.4f}")
+                print(f"   Discriminator A Loss: {epoch_losses['disc_A']:.4f}")
+                print(f"   Discriminator B Loss: {epoch_losses['disc_B']:.4f}")
+                print(f"   Epoch time: {epoch_time/60:.1f} minutes")
+                
+            except KeyboardInterrupt:
+                print("\n\n⚠️  Training interrupted by user!")
+                raise  # Re-raise to trigger signal handler
+            except Exception as e:
+                print(f"\n\n❌ Error during epoch {epoch+1}: {e}")
+                print("Attempting to save emergency checkpoint...")
+                try:
+                    save_checkpoint(
+                        epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
+                        optimizer_G, optimizer_D, losses_history,
+                        args.checkpoint_dir, args.experiment_name,
+                        save_latest=True
+                    )
+                    print("✅ Emergency checkpoint saved! You can resume training.")
+                except Exception as save_error:
+                    print(f"❌ Failed to save emergency checkpoint: {save_error}")
+                raise  # Re-raise the original error
+        
+        print("\n✅ Training completed!")
+        
+    except KeyboardInterrupt:
+        # Signal handler will save checkpoint
+        pass
+    except Exception as e:
+        print(f"\n❌ Training failed with error: {e}")
+        print("Attempting final emergency checkpoint save...")
+        try:
+            save_checkpoint(
+                current_epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
+                optimizer_G, optimizer_D, losses_history,
+                args.checkpoint_dir, args.experiment_name,
+                save_latest=True
+            )
+            print("✅ Final checkpoint saved!")
+        except:
+            print("❌ Failed to save final checkpoint")
+        raise
+    finally:
+        try:
+            wandb.finish()
+        except:
+            pass
 
 
 if __name__ == "__main__":
