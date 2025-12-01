@@ -208,7 +208,7 @@ def load_checkpoint(checkpoint_path, gen_A2B, gen_B2A, disc_A, disc_B,
 
 
 def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader, 
-                optimizer_G, optimizer_D, losses_fn, device, epoch):
+                optimizer_G, optimizer_D, losses_fn, device, epoch, scaler=None):
     """
     Train for one epoch
     """
@@ -235,50 +235,74 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         # ==================== Train Generators ====================
         optimizer_G.zero_grad()
         
-        # Forward pass
-        fake_B = gen_A2B(real_A)
-        fake_A = gen_B2A(real_B)
+        # Use mixed precision for forward pass (faster training)
+        use_amp = scaler is not None
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            # Forward pass
+            fake_B = gen_A2B(real_A)
+            fake_A = gen_B2A(real_B)
+            
+            rec_A = gen_B2A(fake_B)  # A → B → A
+            rec_B = gen_A2B(fake_A)  # B → A → B
+            
+            # Identity mapping (optional, helps preserve color)
+            identity_A = gen_B2A(real_A)
+            identity_B = gen_A2B(real_B)
+            
+            # Discriminator predictions on fake images
+            fake_B_pred = disc_B(fake_B)
+            fake_A_pred = disc_A(fake_A)
+            
+            # Generator losses
+            gen_losses = losses_fn.generator_loss(
+                fake_A_pred, fake_B_pred,
+                real_A, rec_A, real_B, rec_B,
+                identity_A, identity_B
+            )
+            
+            gen_total = gen_losses['total']
         
-        rec_A = gen_B2A(fake_B)  # A → B → A
-        rec_B = gen_A2B(fake_A)  # B → A → B
-        
-        # Identity mapping (optional, helps preserve color)
-        identity_A = gen_B2A(real_A)
-        identity_B = gen_A2B(real_B)
-        
-        # Discriminator predictions on fake images
-        fake_B_pred = disc_B(fake_B)
-        fake_A_pred = disc_A(fake_A)
-        
-        # Generator losses
-        gen_losses = losses_fn.generator_loss(
-            fake_A_pred, fake_B_pred,
-            real_A, rec_A, real_B, rec_B,
-            identity_A, identity_B
-        )
-        
-        gen_total = gen_losses['total']
-        gen_total.backward()
-        optimizer_G.step()
+        # Backward pass with mixed precision support
+        if use_amp:
+            scaler.scale(gen_total).backward()
+            scaler.step(optimizer_G)
+            scaler.update()
+        else:
+            gen_total.backward()
+            optimizer_G.step()
         
         # ==================== Train Discriminators ====================
         # Discriminator A
         optimizer_D.zero_grad()
         
-        real_A_pred = disc_A(real_A)
-        fake_A_pred_detached = disc_A(fake_A.detach())
-        disc_A_loss = losses_fn.discriminator_loss(real_A_pred, fake_A_pred_detached)
-        disc_A_loss.backward()
-        optimizer_D.step()
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            real_A_pred = disc_A(real_A)
+            fake_A_pred_detached = disc_A(fake_A.detach())
+            disc_A_loss = losses_fn.discriminator_loss(real_A_pred, fake_A_pred_detached)
+        
+        if use_amp:
+            scaler.scale(disc_A_loss).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+        else:
+            disc_A_loss.backward()
+            optimizer_D.step()
         
         # Discriminator B
         optimizer_D.zero_grad()
         
-        real_B_pred = disc_B(real_B)
-        fake_B_pred_detached = disc_B(fake_B.detach())
-        disc_B_loss = losses_fn.discriminator_loss(real_B_pred, fake_B_pred_detached)
-        disc_B_loss.backward()
-        optimizer_D.step()
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            real_B_pred = disc_B(real_B)
+            fake_B_pred_detached = disc_B(fake_B.detach())
+            disc_B_loss = losses_fn.discriminator_loss(real_B_pred, fake_B_pred_detached)
+        
+        if use_amp:
+            scaler.scale(disc_B_loss).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+        else:
+            disc_B_loss.backward()
+            optimizer_D.step()
         
         # Accumulate losses
         epoch_losses['gen_total'] += gen_total.item()
@@ -288,8 +312,12 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         epoch_losses['disc_A'] += disc_A_loss.item()
         epoch_losses['disc_B'] += disc_B_loss.item()
         
-        # Log to WandB every N steps
-        if step % 100 == 0:
+        # Log to WandB every N steps (reduced frequency for better performance)
+        # Logging less frequently reduces overhead and speeds up training
+        log_freq = 200  # Log every 200 steps instead of 100
+        image_log_freq = 1000  # Log images every 1000 steps instead of 500
+        
+        if step % log_freq == 0:
             wandb.log({
                 "loss/gen_total": gen_total.item(),
                 "loss/gen_adv": gen_losses['adversarial'].item(),
@@ -301,8 +329,8 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
                 "step": epoch * num_batches + step,
             })
             
-            # Log image grid every 500 steps
-            if step % 500 == 0:
+            # Log image grid less frequently to avoid expensive matplotlib operations
+            if step % image_log_freq == 0:
                 log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, 
                              epoch, step, wandb.run.name)
     
@@ -415,8 +443,20 @@ def train(args):
     ])
     
     dataset = ImageDataset(args.data_A, args.data_B, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, 
-                           shuffle=True, num_workers=2)
+    # Optimize DataLoader for faster data loading
+    # num_workers: Use 4-8 for better parallelization (adjust based on CPU cores)
+    # pin_memory: Faster GPU transfer when using CUDA
+    # persistent_workers: Keep workers alive between epochs to avoid recreation overhead
+    num_workers = min(8, os.cpu_count() or 4)  # Use up to 8 workers, or CPU count if less
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
+        prefetch_factor=2 if num_workers > 0 else 2  # Prefetch batches
+    )
     
     # ==================== Initialize Models ====================
     if args.architecture == 'resnet':
@@ -450,11 +490,25 @@ def train(args):
         lambda_identity=args.lambda_identity
     )
     
+    # ==================== Mixed Precision Training ====================
+    # Use Automatic Mixed Precision (AMP) for faster training and lower memory usage
+    # This can speed up training by 1.5-2x on modern GPUs
+    use_amp = args.use_amp and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        print("Mixed Precision Training (AMP) enabled - faster training!")
+    
     # ==================== Load Checkpoint if Resuming ====================
     start_epoch = 0
     losses_history = []
     
     if args.resume_from:
+        if not os.path.exists(args.resume_from):
+            raise FileNotFoundError(
+                f" Checkpoint file not found: {args.resume_from}\n"
+                f"   Please check the path and try again.\n"
+                f"   Example checkpoint path: /content/drive/MyDrive/GANsHomework/cyclegan_checkpoints/resnet-baseline_epoch_5.pth"
+            )
         start_epoch, exp_name, losses_history = load_checkpoint(
             args.resume_from,
             gen_A2B, gen_B2A, disc_A, disc_B,
@@ -463,11 +517,12 @@ def train(args):
         )
         # Update experiment name if resuming
         if exp_name != args.experiment_name:
-            print(f"⚠️  Warning: Experiment name mismatch. Using checkpoint name: {exp_name}")
+            print(f"  Warning: Experiment name mismatch. Using checkpoint name: {exp_name}")
             args.experiment_name = exp_name
+        print(f" Resuming from epoch {start_epoch}, will train until epoch {args.epochs}")
     
     # ==================== Training Loop ====================
-    print(f"🎯 Starting training: {args.experiment_name}")
+    print(f"   Starting training: {args.experiment_name}")
     print(f"   Architecture: {args.architecture}")
     print(f"   Epochs: {args.epochs} (starting from {start_epoch})")
     print(f"   Batch size: {args.batch_size}")
@@ -479,7 +534,7 @@ def train(args):
         epoch_losses, sample_images = train_epoch(
             gen_A2B, gen_B2A, disc_A, disc_B,
             dataloader, optimizer_G, optimizer_D,
-            losses_fn, device, epoch
+            losses_fn, device, epoch, scaler
         )
         
         # Store losses
@@ -543,6 +598,8 @@ if __name__ == "__main__":
                        help="Weight for cycle consistency loss")
     parser.add_argument("--lambda_identity", type=float, default=0.5,
                        help="Weight for identity loss")
+    parser.add_argument("--use_amp", action="store_true", default=True,
+                       help="Use Automatic Mixed Precision (AMP) for faster training (default: True)")
     
     # Checkpoint arguments
     parser.add_argument("--checkpoint_dir", type=str,
@@ -562,4 +619,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     train(args)
-
