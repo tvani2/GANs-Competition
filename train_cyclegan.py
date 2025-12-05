@@ -97,9 +97,13 @@ def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_d
         fixed_pairs_results: List of tuples (real_A, fake_B, rec_A) for 5 pairs
         epoch: Current epoch number
         experiment_name: Name of the experiment
-        output_dir: Directory to save images
+        output_dir: Base directory to save images (will create epoch subdirectory)
     """
-    os.makedirs(output_dir, exist_ok=True)
+    epoch_str = f"epoch_{epoch+1:03d}"  # e.g., epoch_015, epoch_030
+    
+    # Create epoch-specific subdirectory
+    epoch_output_dir = os.path.join(output_dir, epoch_str)
+    os.makedirs(epoch_output_dir, exist_ok=True)
     
     try:
         from PIL import Image as PILImage
@@ -107,8 +111,6 @@ def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_d
         # Convert float32 [0,1] to uint8 [0,255] for saving
         def to_uint8(img):
             return (np.clip(img, 0, 1) * 255).astype(np.uint8)
-        
-        epoch_str = f"epoch_{epoch+1:03d}"  # e.g., epoch_015, epoch_030
         
         # Create a grid showing all 5 pairs: 5 rows x 3 columns (Photo, Generated Monet, Reconstructed Photo)
         fig, axes = plt.subplots(5, 3, figsize=(12, 20))
@@ -121,7 +123,7 @@ def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_d
             img_rec_A = tensor_to_image(rec_A[0])
             
             # Save individual images for this pair
-            pair_dir = os.path.join(output_dir, f"pair_{pair_idx+1}")
+            pair_dir = os.path.join(epoch_output_dir, f"pair_{pair_idx+1}")
             os.makedirs(pair_dir, exist_ok=True)
             
             PILImage.fromarray(to_uint8(img_A)).save(
@@ -151,11 +153,11 @@ def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_d
                      fontsize=16, fontweight='bold', y=0.995)
         plt.tight_layout(rect=[0, 0, 1, 0.99])
         
-        grid_path = os.path.join(output_dir, f'{experiment_name}_{epoch_str}_all_pairs.png')
+        grid_path = os.path.join(epoch_output_dir, f'{experiment_name}_{epoch_str}_all_pairs.png')
         plt.savefig(grid_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
         
-        print(f"   Saved 5 fixed image pairs for epoch {epoch+1}")
+        print(f"   Saved 5 fixed image pairs for epoch {epoch+1} to {epoch_output_dir}")
         
     except Exception as e:
         print(f"Warning: Failed to save fixed image pairs: {e}. Continuing...")
@@ -948,7 +950,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_images", action="store_true", default=True,
                        help="Save generated images to disk for comparison across epochs (default: True)")
     parser.add_argument("--image_output_dir", type=str, default=None,
-                       help="Directory to save generated images (default: checkpoint_dir/images/experiment_name)")
+                       help="Base directory to save generated images (default: checkpoint_dir/images/experiment_name). Images are organized by epoch in subdirectories.")
     parser.add_argument("--image_save_freq", type=int, default=None,
                        help="Save images every N epochs (default: same as checkpoint_freq)")
     
