@@ -19,7 +19,11 @@ from torchvision.utils import make_grid
 import wandb
 import numpy as np
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to prevent display issues
 import matplotlib.pyplot as plt
+# Configure matplotlib to prevent too many open figures warning
+plt.rcParams['figure.max_open_warning'] = 0
 import signal
 import sys
 import time
@@ -75,9 +79,86 @@ def tensor_to_image(tensor):
     # Denormalize from [-1, 1] to [0, 1]
     tensor = (tensor + 1) / 2.0
     tensor = tensor.clamp(0, 1)
-    # Convert to numpy
+    # Convert to numpy and ensure correct dtype (float32 for WandB compatibility)
     image = tensor.cpu().detach().permute(1, 2, 0).numpy()
+    # Ensure dtype is float32 (WandB requires byte, short, float32, or float64)
+    if image.dtype != np.float32:
+        image = image.astype(np.float32)
+    # Ensure values are in [0, 1] range
+    image = np.clip(image, 0.0, 1.0)
     return image
+
+
+def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_dir):
+    """
+    Save 5 fixed photo->painting pairs for consistent comparison across epochs
+    
+    Args:
+        fixed_pairs_results: List of tuples (real_A, fake_B, rec_A) for 5 pairs
+        epoch: Current epoch number
+        experiment_name: Name of the experiment
+        output_dir: Directory to save images
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    try:
+        from PIL import Image as PILImage
+        
+        # Convert float32 [0,1] to uint8 [0,255] for saving
+        def to_uint8(img):
+            return (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        
+        epoch_str = f"epoch_{epoch+1:03d}"  # e.g., epoch_015, epoch_030
+        
+        # Create a grid showing all 5 pairs: 5 rows x 3 columns (Photo, Generated Monet, Reconstructed Photo)
+        fig, axes = plt.subplots(5, 3, figsize=(12, 20))
+        fig.patch.set_facecolor('white')
+        
+        for pair_idx, (real_A, fake_B, rec_A) in enumerate(fixed_pairs_results):
+            # Convert tensors to images
+            img_A = tensor_to_image(real_A[0])
+            img_B = tensor_to_image(fake_B[0])
+            img_rec_A = tensor_to_image(rec_A[0])
+            
+            # Save individual images for this pair
+            pair_dir = os.path.join(output_dir, f"pair_{pair_idx+1}")
+            os.makedirs(pair_dir, exist_ok=True)
+            
+            PILImage.fromarray(to_uint8(img_A)).save(
+                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_real_photo.png')
+            )
+            PILImage.fromarray(to_uint8(img_B)).save(
+                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_generated_monet.png')
+            )
+            PILImage.fromarray(to_uint8(img_rec_A)).save(
+                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_reconstructed_photo.png')
+            )
+            
+            # Display in grid
+            axes[pair_idx, 0].imshow(img_A)
+            axes[pair_idx, 0].set_title(f'Pair {pair_idx+1} - Real Photo', fontsize=10, fontweight='bold')
+            axes[pair_idx, 0].axis('off')
+            
+            axes[pair_idx, 1].imshow(img_B)
+            axes[pair_idx, 1].set_title(f'Pair {pair_idx+1} - Generated Monet', fontsize=10, fontweight='bold', color='green')
+            axes[pair_idx, 1].axis('off')
+            
+            axes[pair_idx, 2].imshow(img_rec_A)
+            axes[pair_idx, 2].set_title(f'Pair {pair_idx+1} - Reconstructed', fontsize=10, fontweight='bold')
+            axes[pair_idx, 2].axis('off')
+        
+        plt.suptitle(f'{experiment_name} - Epoch {epoch+1} (5 Fixed Pairs)', 
+                     fontsize=16, fontweight='bold', y=0.995)
+        plt.tight_layout(rect=[0, 0, 1, 0.99])
+        
+        grid_path = os.path.join(output_dir, f'{experiment_name}_{epoch_str}_all_pairs.png')
+        plt.savefig(grid_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        
+        print(f"   Saved 5 fixed image pairs for epoch {epoch+1}")
+        
+    except Exception as e:
+        print(f"Warning: Failed to save fixed image pairs: {e}. Continuing...")
 
 
 def log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, epoch, step, 
@@ -85,67 +166,96 @@ def log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, epoch, step,
     """
     Create and log before/after comparison grid to WandB with enhanced styling
     """
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.patch.set_facecolor('white')
+    fig = None
+    fig2 = None
+    fig3 = None
     
-    # Row 1: Photo → Monet → Photo
-    axes[0, 0].imshow(tensor_to_image(real_A[0]))
-    axes[0, 0].set_title('Real Photo', fontsize=14, fontweight='bold', pad=10)
-    axes[0, 0].axis('off')
-    
-    axes[0, 1].imshow(tensor_to_image(fake_B[0]))
-    axes[0, 1].set_title('Generated Monet', fontsize=14, fontweight='bold', pad=10, color='green')
-    axes[0, 1].axis('off')
-    
-    axes[0, 2].imshow(tensor_to_image(rec_A[0]))
-    axes[0, 2].set_title('Reconstructed Photo', fontsize=14, fontweight='bold', pad=10)
-    axes[0, 2].axis('off')
-    
-    # Row 2: Monet → Photo → Monet
-    axes[1, 0].imshow(tensor_to_image(real_B[0]))
-    axes[1, 0].set_title('Real Monet', fontsize=14, fontweight='bold', pad=10)
-    axes[1, 0].axis('off')
-    
-    axes[1, 1].imshow(tensor_to_image(fake_A[0]))
-    axes[1, 1].set_title('Generated Photo', fontsize=14, fontweight='bold', pad=10, color='green')
-    axes[1, 1].axis('off')
-    
-    axes[1, 2].imshow(tensor_to_image(rec_B[0]))
-    axes[1, 2].set_title('Reconstructed Monet', fontsize=14, fontweight='bold', pad=10)
-    axes[1, 2].axis('off')
-    
-    plt.suptitle(f'{experiment_name} - Epoch {epoch+1}, Step {step}', 
-                 fontsize=16, fontweight='bold', y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    
-    # Log to WandB
-    wandb.log({f"images/comparison_grid": wandb.Image(fig)})
-    plt.close()
-    
-    # Also log individual image pairs for better tracking
-    fig2, axes2 = plt.subplots(1, 2, figsize=(12, 6))
-    fig2.patch.set_facecolor('white')
-    axes2[0].imshow(tensor_to_image(real_A[0]))
-    axes2[0].set_title('Input Photo', fontsize=12, fontweight='bold')
-    axes2[0].axis('off')
-    axes2[1].imshow(tensor_to_image(fake_B[0]))
-    axes2[1].set_title('Generated Monet', fontsize=12, fontweight='bold', color='green')
-    axes2[1].axis('off')
-    plt.tight_layout()
-    wandb.log({f"images/photo_to_monet": wandb.Image(fig2)})
-    plt.close(fig2)
-    
-    fig3, axes3 = plt.subplots(1, 2, figsize=(12, 6))
-    fig3.patch.set_facecolor('white')
-    axes3[0].imshow(tensor_to_image(real_B[0]))
-    axes3[0].set_title('Input Monet', fontsize=12, fontweight='bold')
-    axes3[0].axis('off')
-    axes3[1].imshow(tensor_to_image(fake_A[0]))
-    axes3[1].set_title('Generated Photo', fontsize=12, fontweight='bold', color='green')
-    axes3[1].axis('off')
-    plt.tight_layout()
-    wandb.log({f"images/monet_to_photo": wandb.Image(fig3)})
-    plt.close(fig3)
+    try:
+        # Configure matplotlib to prevent too many open figures warning
+        plt.rcParams['figure.max_open_warning'] = 0
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.patch.set_facecolor('white')
+        
+        # Row 1: Photo → Monet → Photo
+        img_A = tensor_to_image(real_A[0])
+        img_B = tensor_to_image(fake_B[0])
+        img_rec_A = tensor_to_image(rec_A[0])
+        
+        axes[0, 0].imshow(img_A)
+        axes[0, 0].set_title('Real Photo', fontsize=14, fontweight='bold', pad=10)
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(img_B)
+        axes[0, 1].set_title('Generated Monet', fontsize=14, fontweight='bold', pad=10, color='green')
+        axes[0, 1].axis('off')
+        
+        axes[0, 2].imshow(img_rec_A)
+        axes[0, 2].set_title('Reconstructed Photo', fontsize=14, fontweight='bold', pad=10)
+        axes[0, 2].axis('off')
+        
+        # Row 2: Monet → Photo → Monet
+        img_B_real = tensor_to_image(real_B[0])
+        img_A_fake = tensor_to_image(fake_A[0])
+        img_rec_B = tensor_to_image(rec_B[0])
+        
+        axes[1, 0].imshow(img_B_real)
+        axes[1, 0].set_title('Real Monet', fontsize=14, fontweight='bold', pad=10)
+        axes[1, 0].axis('off')
+        
+        axes[1, 1].imshow(img_A_fake)
+        axes[1, 1].set_title('Generated Photo', fontsize=14, fontweight='bold', pad=10, color='green')
+        axes[1, 1].axis('off')
+        
+        axes[1, 2].imshow(img_rec_B)
+        axes[1, 2].set_title('Reconstructed Monet', fontsize=14, fontweight='bold', pad=10)
+        axes[1, 2].axis('off')
+        
+        plt.suptitle(f'{experiment_name} - Epoch {epoch+1}, Step {step}', 
+                     fontsize=16, fontweight='bold', y=0.98)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        # Log to WandB
+        wandb.log({f"images/comparison_grid": wandb.Image(fig)})
+        plt.close(fig)
+        fig = None
+        
+        # Also log individual image pairs for better tracking
+        fig2, axes2 = plt.subplots(1, 2, figsize=(12, 6))
+        fig2.patch.set_facecolor('white')
+        axes2[0].imshow(img_A)
+        axes2[0].set_title('Input Photo', fontsize=12, fontweight='bold')
+        axes2[0].axis('off')
+        axes2[1].imshow(img_B)
+        axes2[1].set_title('Generated Monet', fontsize=12, fontweight='bold', color='green')
+        axes2[1].axis('off')
+        plt.tight_layout()
+        wandb.log({f"images/photo_to_monet": wandb.Image(fig2)})
+        plt.close(fig2)
+        fig2 = None
+        
+        fig3, axes3 = plt.subplots(1, 2, figsize=(12, 6))
+        fig3.patch.set_facecolor('white')
+        axes3[0].imshow(img_B_real)
+        axes3[0].set_title('Input Monet', fontsize=12, fontweight='bold')
+        axes3[0].axis('off')
+        axes3[1].imshow(img_A_fake)
+        axes3[1].set_title('Generated Photo', fontsize=12, fontweight='bold', color='green')
+        axes3[1].axis('off')
+        plt.tight_layout()
+        wandb.log({f"images/monet_to_photo": wandb.Image(fig3)})
+        plt.close(fig3)
+        fig3 = None
+        
+    except Exception as e:
+        # Ensure all figures are closed even on error
+        if fig is not None:
+            plt.close(fig)
+        if fig2 is not None:
+            plt.close(fig2)
+        if fig3 is not None:
+            plt.close(fig3)
+        raise e
 
 
 def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B, 
@@ -385,62 +495,69 @@ def plot_loss_curves(losses_history):
     """
     Create and log loss curves plot to WandB
     """
-    epochs = [l['epoch'] for l in losses_history]
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.patch.set_facecolor('white')
-    
-    # Generator losses
-    axes[0, 0].plot(epochs, [l['gen_total'] for l in losses_history], 
-                   'b-', linewidth=2, label='Total')
-    axes[0, 0].plot(epochs, [l['gen_adv'] for l in losses_history], 
-                   'r--', linewidth=1.5, alpha=0.7, label='Adversarial')
-    axes[0, 0].plot(epochs, [l['gen_cycle'] for l in losses_history], 
-                   'g--', linewidth=1.5, alpha=0.7, label='Cycle')
-    axes[0, 0].set_xlabel('Epoch', fontsize=12)
-    axes[0, 0].set_ylabel('Loss', fontsize=12)
-    axes[0, 0].set_title('Generator Losses', fontsize=14, fontweight='bold')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Discriminator losses
-    axes[0, 1].plot(epochs, [l['disc_A'] for l in losses_history], 
-                   'orange', linewidth=2, label='Disc A')
-    axes[0, 1].plot(epochs, [l['disc_B'] for l in losses_history], 
-                   'purple', linewidth=2, label='Disc B')
-    axes[0, 1].set_xlabel('Epoch', fontsize=12)
-    axes[0, 1].set_ylabel('Loss', fontsize=12)
-    axes[0, 1].set_title('Discriminator Losses', fontsize=14, fontweight='bold')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Combined plot
-    axes[1, 0].plot(epochs, [l['gen_total'] for l in losses_history], 
-                   'b-', linewidth=2, label='Generator Total')
-    axes[1, 0].plot(epochs, [(l['disc_A'] + l['disc_B'])/2 for l in losses_history], 
-                   'r-', linewidth=2, label='Discriminator Avg')
-    axes[1, 0].set_xlabel('Epoch', fontsize=12)
-    axes[1, 0].set_ylabel('Loss', fontsize=12)
-    axes[1, 0].set_title('Generator vs Discriminator', fontsize=14, fontweight='bold')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # Component breakdown
-    axes[1, 1].plot(epochs, [l['gen_adv'] for l in losses_history], 
-                   label='Adversarial', linewidth=2)
-    axes[1, 1].plot(epochs, [l['gen_cycle'] for l in losses_history], 
-                   label='Cycle', linewidth=2)
-    axes[1, 1].plot(epochs, [l['gen_identity'] for l in losses_history], 
-                   label='Identity', linewidth=2)
-    axes[1, 1].set_xlabel('Epoch', fontsize=12)
-    axes[1, 1].set_ylabel('Loss', fontsize=12)
-    axes[1, 1].set_title('Generator Loss Components', fontsize=14, fontweight='bold')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    wandb.log({"plots/loss_curves": wandb.Image(fig)})
-    plt.close()
+    fig = None
+    try:
+        epochs = [l['epoch'] for l in losses_history]
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.patch.set_facecolor('white')
+        
+        # Generator losses
+        axes[0, 0].plot(epochs, [l['gen_total'] for l in losses_history], 
+                       'b-', linewidth=2, label='Total')
+        axes[0, 0].plot(epochs, [l['gen_adv'] for l in losses_history], 
+                       'r--', linewidth=1.5, alpha=0.7, label='Adversarial')
+        axes[0, 0].plot(epochs, [l['gen_cycle'] for l in losses_history], 
+                       'g--', linewidth=1.5, alpha=0.7, label='Cycle')
+        axes[0, 0].set_xlabel('Epoch', fontsize=12)
+        axes[0, 0].set_ylabel('Loss', fontsize=12)
+        axes[0, 0].set_title('Generator Losses', fontsize=14, fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Discriminator losses
+        axes[0, 1].plot(epochs, [l['disc_A'] for l in losses_history], 
+                       'orange', linewidth=2, label='Disc A')
+        axes[0, 1].plot(epochs, [l['disc_B'] for l in losses_history], 
+                       'purple', linewidth=2, label='Disc B')
+        axes[0, 1].set_xlabel('Epoch', fontsize=12)
+        axes[0, 1].set_ylabel('Loss', fontsize=12)
+        axes[0, 1].set_title('Discriminator Losses', fontsize=14, fontweight='bold')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Combined plot
+        axes[1, 0].plot(epochs, [l['gen_total'] for l in losses_history], 
+                       'b-', linewidth=2, label='Generator Total')
+        axes[1, 0].plot(epochs, [(l['disc_A'] + l['disc_B'])/2 for l in losses_history], 
+                       'r-', linewidth=2, label='Discriminator Avg')
+        axes[1, 0].set_xlabel('Epoch', fontsize=12)
+        axes[1, 0].set_ylabel('Loss', fontsize=12)
+        axes[1, 0].set_title('Generator vs Discriminator', fontsize=14, fontweight='bold')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Component breakdown
+        axes[1, 1].plot(epochs, [l['gen_adv'] for l in losses_history], 
+                       label='Adversarial', linewidth=2)
+        axes[1, 1].plot(epochs, [l['gen_cycle'] for l in losses_history], 
+                       label='Cycle', linewidth=2)
+        axes[1, 1].plot(epochs, [l['gen_identity'] for l in losses_history], 
+                       label='Identity', linewidth=2)
+        axes[1, 1].set_xlabel('Epoch', fontsize=12)
+        axes[1, 1].set_ylabel('Loss', fontsize=12)
+        axes[1, 1].set_title('Generator Loss Components', fontsize=14, fontweight='bold')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        wandb.log({"plots/loss_curves": wandb.Image(fig)})
+        plt.close(fig)
+        fig = None
+    except Exception as e:
+        if fig is not None:
+            plt.close(fig)
+        raise e
 
 
 # Global variables for signal handler
@@ -578,6 +695,35 @@ def train(args):
             args.experiment_name = exp_name
         print(f" Resuming from epoch {start_epoch}, will train until epoch {args.epochs}")
     
+    # ==================== Setup Image Output Directory ====================
+    # Save images for comparison across epochs (for your tutor's graphs!)
+    fixed_image_pairs_original = None  # Store original images for consistent comparison
+    # Set image save frequency (default to checkpoint_freq if not specified)
+    image_save_freq = args.image_save_freq if args.image_save_freq is not None else args.checkpoint_freq
+    
+    if args.save_images:
+        if args.image_output_dir is None:
+            args.image_output_dir = os.path.join(args.checkpoint_dir, "images", args.experiment_name)
+        os.makedirs(args.image_output_dir, exist_ok=True)
+        print(f"   Images will be saved to: {args.image_output_dir}")
+        print(f"   Images saved at epochs: every {image_save_freq} epochs")
+        print(f"   Saving 5 fixed photo->painting pairs for consistent comparison")
+        
+        # Get 5 fixed image pairs at the start (same images used across all epochs)
+        print("   Selecting 5 fixed image pairs...")
+        fixed_image_pairs_original = []
+        with torch.no_grad():
+            gen_A2B.eval()
+            gen_B2A.eval()
+            for batch_idx, (real_A, real_B) in enumerate(dataloader):
+                if batch_idx >= 5:
+                    break
+                # Store original images (will regenerate transformations at each checkpoint)
+                fixed_image_pairs_original.append(real_A.to(device))
+            gen_A2B.train()
+            gen_B2A.train()
+        print(f"   Selected 5 fixed image pairs for consistent comparison")
+    
     # ==================== Training Loop ====================
     print(f"   Starting training: {args.experiment_name}")
     print(f"   Architecture: {args.architecture}")
@@ -664,6 +810,28 @@ def train(args):
                 except Exception as e:
                     print(f"Warning: Image grid logging failed: {e}. Continuing...")
                 
+                # Save 5 fixed image pairs for comparison across epochs
+                if args.save_images and fixed_image_pairs_original is not None:
+                    # Use image_save_freq (which defaults to checkpoint_freq if not set)
+                    if (epoch + 1) % image_save_freq == 0 or (epoch + 1) == args.epochs:
+                        try:
+                            # Regenerate transformations for the fixed pairs using current model
+                            gen_A2B.eval()
+                            gen_B2A.eval()
+                            fixed_pairs_results = []
+                            with torch.no_grad():
+                                for real_A_fixed in fixed_image_pairs_original:
+                                    fake_B_fixed = gen_A2B(real_A_fixed)
+                                    rec_A_fixed = gen_B2A(fake_B_fixed)
+                                    fixed_pairs_results.append((real_A_fixed, fake_B_fixed, rec_A_fixed))
+                            gen_A2B.train()
+                            gen_B2A.train()
+                            
+                            # Save the 5 fixed pairs
+                            save_fixed_image_pairs(fixed_pairs_results, epoch, args.experiment_name, args.image_output_dir)
+                        except Exception as e:
+                            print(f"Warning: Failed to save fixed image pairs: {e}. Continuing...")
+                
                 # Save checkpoint every epoch as backup (quick recovery)
                 try:
                     save_checkpoint(
@@ -728,9 +896,9 @@ def train(args):
                 args.checkpoint_dir, args.experiment_name,
                 save_latest=True
             )
-            print("✅ Final checkpoint saved!")
+            print(" Final checkpoint saved!")
         except:
-            print("❌ Failed to save final checkpoint")
+            print(" Failed to save final checkpoint")
         raise
     finally:
         try:
@@ -775,6 +943,14 @@ if __name__ == "__main__":
                        help="Save checkpoint every N epochs")
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Path to checkpoint to resume from")
+    
+    # Image saving arguments (for comparison and visualization)
+    parser.add_argument("--save_images", action="store_true", default=True,
+                       help="Save generated images to disk for comparison across epochs (default: True)")
+    parser.add_argument("--image_output_dir", type=str, default=None,
+                       help="Directory to save generated images (default: checkpoint_dir/images/experiment_name)")
+    parser.add_argument("--image_save_freq", type=int, default=None,
+                       help="Save images every N epochs (default: same as checkpoint_freq)")
     
     # WandB arguments
     parser.add_argument("--project_name", type=str, default="cyclegan-experiments",
