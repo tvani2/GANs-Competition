@@ -192,4 +192,3 @@ class UNetGenerator(nn.Module):
         output = self.final(d7)  # 256x256
         
         return output
-

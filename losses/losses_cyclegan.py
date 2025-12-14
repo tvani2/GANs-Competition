@@ -206,4 +206,3 @@ class CycleGANLosses:
             'identity': identity_loss_total,
             'total': total_loss
         }
-
