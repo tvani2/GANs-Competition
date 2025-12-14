@@ -11,11 +11,9 @@ This script trains CycleGAN models with:
 import os
 import argparse
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.utils import make_grid
 import wandb
 import numpy as np
 from PIL import Image
@@ -27,6 +25,8 @@ plt.rcParams['figure.max_open_warning'] = 0
 import signal
 import sys
 import time
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
 
 # Import your models and losses
 from models import ResNetGenerator, UNetGenerator, PatchGANDiscriminator
@@ -126,14 +126,18 @@ def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_d
             pair_dir = os.path.join(epoch_output_dir, f"pair_{pair_idx+1}")
             os.makedirs(pair_dir, exist_ok=True)
             
+            # Save with high quality PNG settings (compress_level=1 for best quality/speed balance)
             PILImage.fromarray(to_uint8(img_A)).save(
-                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_real_photo.png')
+                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_real_photo.png'),
+                compress_level=1, optimize=False
             )
             PILImage.fromarray(to_uint8(img_B)).save(
-                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_generated_monet.png')
+                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_generated_monet.png'),
+                compress_level=1, optimize=False
             )
             PILImage.fromarray(to_uint8(img_rec_A)).save(
-                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_reconstructed_photo.png')
+                os.path.join(pair_dir, f'{experiment_name}_{epoch_str}_reconstructed_photo.png'),
+                compress_level=1, optimize=False
             )
             
             # Display in grid
@@ -154,7 +158,9 @@ def save_fixed_image_pairs(fixed_pairs_results, epoch, experiment_name, output_d
         plt.tight_layout(rect=[0, 0, 1, 0.99])
         
         grid_path = os.path.join(epoch_output_dir, f'{experiment_name}_{epoch_str}_all_pairs.png')
-        plt.savefig(grid_path, dpi=150, bbox_inches='tight', facecolor='white')
+        # Save with high DPI (300) for publication-quality images
+        plt.savefig(grid_path, dpi=300, bbox_inches='tight', facecolor='white', 
+                   pil_kwargs={'compress_level': 1, 'optimize': False})
         plt.close(fig)
         
         print(f"   Saved 5 fixed image pairs for epoch {epoch+1} to {epoch_output_dir}")
@@ -264,11 +270,14 @@ def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B,
                    optimizer_G, optimizer_D, losses_history, checkpoint_dir, 
                    experiment_name, save_latest=False):
     """
-    Save complete checkpoint to Google Drive and WandB
+    Save complete checkpoint to Google Drive using atomic writes to prevent corruption
     
     Args:
         save_latest: If True, also save as 'latest.pth' for quick recovery
     """
+    import tempfile
+    import shutil
+    
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     checkpoint_path = os.path.join(checkpoint_dir, 
@@ -286,15 +295,58 @@ def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B,
         'losses_history': losses_history,
     }
     
+    def atomic_save(target_path, checkpoint_data):
+        """Save checkpoint atomically using temp file + rename to prevent corruption"""
+        # Create temp file in the same directory (important for atomic rename)
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=os.path.dirname(target_path),
+            prefix='.tmp_checkpoint_',
+            suffix='.pth'
+        )
+        
+        try:
+            # Close the file descriptor, we'll use torch.save
+            os.close(temp_fd)
+            
+            # Save to temp file
+            torch.save(checkpoint_data, temp_path)
+            
+            # Verify the file was written correctly by checking size
+            file_size = os.path.getsize(temp_path)
+            if file_size < 1024:  # Less than 1KB is suspicious
+                raise ValueError(f"Saved checkpoint is too small ({file_size} bytes), likely corrupted")
+            
+            # Atomic rename (on same filesystem this is atomic)
+            # Note: On Windows/Drive, we need to remove target first if it exists
+            if os.path.exists(target_path):
+                try:
+                    os.remove(target_path)
+                except:
+                    pass  # Ignore if file doesn't exist or can't be removed
+            
+            shutil.move(temp_path, target_path)
+            
+            return file_size
+            
+        except Exception as e:
+            # Clean up temp file if something went wrong
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            raise e
+    
     try:
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
+        # Save main checkpoint with atomic write
+        file_size = atomic_save(checkpoint_path, checkpoint)
+        print(f"✅ Checkpoint saved: {checkpoint_path} ({file_size / (1024*1024):.2f} MB)")
         
         # Also save as 'latest.pth' for quick recovery
         if save_latest:
             latest_path = os.path.join(checkpoint_dir, f'{experiment_name}_latest.pth')
-            torch.save(checkpoint, latest_path)
-            print(f"Latest checkpoint saved: {latest_path}")
+            file_size_latest = atomic_save(latest_path, checkpoint)
+            print(f"✅ Latest checkpoint saved: {latest_path} ({file_size_latest / (1024*1024):.2f} MB)")
         
         # Also save to WandB as artifact (non-blocking, with error handling)
         try:
@@ -302,11 +354,11 @@ def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B,
             artifact.add_file(checkpoint_path)
             wandb.log_artifact(artifact)
         except Exception as e:
-            print(f"Warning: Failed to save to WandB: {e}")
-            print("Checkpoint saved locally, continuing training...")
+            print(f"⚠️  Warning: Failed to save to WandB: {e}")
+            print("   Checkpoint saved locally, continuing training...")
         
     except Exception as e:
-        print(f"ERROR: Failed to save checkpoint: {e}")
+        print(f"❌ ERROR: Failed to save checkpoint: {e}")
         raise
     
     return checkpoint_path
@@ -315,10 +367,78 @@ def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B,
 def load_checkpoint(checkpoint_path, gen_A2B, gen_B2A, disc_A, disc_B, 
                     optimizer_G, optimizer_D, device):
     """
-    Load checkpoint and resume training
+    Load checkpoint and resume training with validation and error recovery
     """
     print(f"📂 Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Check if file exists
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    # Check file size
+    file_size = os.path.getsize(checkpoint_path)
+    if file_size < 1024:  # Less than 1KB is suspicious
+        raise ValueError(
+            f"Checkpoint file appears corrupted (size: {file_size} bytes). "
+            f"File is too small to be a valid checkpoint."
+        )
+    
+    print(f"   File size: {file_size / (1024*1024):.2f} MB")
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except (RuntimeError, EOFError, Exception) as e:
+        error_msg = str(e).lower()
+        if "failed finding central directory" in error_msg or "zip archive" in error_msg or "unexpected eof" in error_msg:
+            # Get directory of checkpoint to suggest alternatives
+            checkpoint_dir = os.path.dirname(checkpoint_path)
+            checkpoint_name = os.path.basename(checkpoint_path)
+            
+            print(f"\n❌ Checkpoint file is corrupted!")
+            print(f"   File: {checkpoint_path}")
+            print(f"   Size: {file_size / (1024*1024):.2f} MB")
+            print(f"   Error: {e}\n")
+            
+            # Try to find alternative checkpoints
+            print("🔍 Scanning for valid alternative checkpoints...")
+            alternative_checkpoints = []
+            
+            if os.path.exists(checkpoint_dir):
+                all_files = sorted(os.listdir(checkpoint_dir), reverse=True)
+                # Look for other epoch checkpoints
+                for f in all_files:
+                    if f.endswith('.pth') and f != checkpoint_name:
+                        alt_path = os.path.join(checkpoint_dir, f)
+                        try:
+                            alt_size = os.path.getsize(alt_path)
+                            # Quick validation: check size
+                            if alt_size > 1024 * 100:  # At least 100KB
+                                # Try to load it
+                                test_ckpt = torch.load(alt_path, map_location='cpu', weights_only=False)
+                                if 'epoch' in test_ckpt:
+                                    epoch_num = test_ckpt['epoch']
+                                    print(f"   ✅ Found valid: {f} (epoch {epoch_num}, {alt_size / (1024*1024):.2f} MB)")
+                                    alternative_checkpoints.append((f, alt_path, epoch_num))
+                                    if len(alternative_checkpoints) >= 3:
+                                        break
+                            else:
+                                print(f"   ⚠️  Too small: {f} ({alt_size} bytes)")
+                        except Exception:
+                            print(f"   ❌ Invalid: {f}")
+            
+            if alternative_checkpoints:
+                print(f"\n✅ Found {len(alternative_checkpoints)} valid checkpoint(s)!")
+                print(f"\n📋 To resume training, use one of these:\n")
+                for alt_name, alt_path, epoch in alternative_checkpoints:
+                    print(f"   --resume_from \"{alt_path}\"")
+                print()
+            else:
+                print(f"\n❌ No valid checkpoints found in: {checkpoint_dir}")
+                print(f"   You may need to start training from scratch.\n")
+            
+            raise RuntimeError(f"Checkpoint corrupted. See suggestions above.") from e
+        else:
+            raise
     
     # Load model weights
     gen_A2B.load_state_dict(checkpoint['gen_A2B_state_dict'])
@@ -361,17 +481,26 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
     
     num_batches = len(dataloader)
     last_progress_time = time.time()
+    progress_update_freq = max(1, num_batches // 20)  # Update 20 times per epoch
     
     for step, (real_A, real_B) in enumerate(dataloader):
         real_A = real_A.to(device)
         real_B = real_B.to(device)
+        
+        # Show progress bar style updates
+        if step % progress_update_freq == 0 or step == num_batches - 1:
+            progress_pct = (step + 1) / num_batches * 100
+            bar_length = 30
+            filled_length = int(bar_length * (step + 1) / num_batches)
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+            print(f"\r  Batch [{step+1:4d}/{num_batches:4d}] |{bar}| {progress_pct:5.1f}%", end='', flush=True)
         
         # ==================== Train Generators ====================
         optimizer_G.zero_grad()
         
         # Use mixed precision for forward pass (faster training)
         use_amp = scaler is not None
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             # Forward pass
             fake_B = gen_A2B(real_A)
             fake_A = gen_B2A(real_B)
@@ -409,7 +538,7 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         # Discriminator A
         optimizer_D.zero_grad()
         
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             real_A_pred = disc_A(real_A)
             fake_A_pred_detached = disc_A(fake_A.detach())
             disc_A_loss = losses_fn.discriminator_loss(real_A_pred, fake_A_pred_detached)
@@ -425,7 +554,7 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         # Discriminator B
         optimizer_D.zero_grad()
         
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             real_B_pred = disc_B(real_B)
             fake_B_pred_detached = disc_B(fake_B.detach())
             disc_B_loss = losses_fn.discriminator_loss(real_B_pred, fake_B_pred_detached)
@@ -446,16 +575,24 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         epoch_losses['disc_A'] += disc_A_loss.item()
         epoch_losses['disc_B'] += disc_B_loss.item()
         
-        # Periodic progress output to prevent inactivity timeout (every 5 minutes)
-        # This helps prevent Colab from disconnecting due to inactivity
+        # Show detailed progress every 10% or every 2 minutes
         current_time = time.time()
-        if current_time - last_progress_time > 300:  # 5 minutes
+        show_detailed_progress = (
+            step % progress_update_freq == 0 or 
+            current_time - last_progress_time > 120 or  # Every 2 minutes
+            step == num_batches - 1  # Last batch
+        )
+        
+        if show_detailed_progress and step > 0:
             elapsed = current_time - last_progress_time
-            print(f"   Progress: Step {step+1}/{num_batches} (Epoch {epoch+1}) - "
-                  f"Gen Loss: {gen_total.item():.4f}, "
-                  f"Disc A: {disc_A_loss.item():.4f}, "
-                  f"Disc B: {disc_B_loss.item():.4f} "
-                  f"[{elapsed:.0f}s since last update]")
+            # Clear the progress bar and show detailed stats
+            print(f"\r  Batch [{step+1:4d}/{num_batches:4d}] - "
+                  f"G_loss: {gen_total.item():.4f} "
+                  f"(adv: {gen_losses['adversarial'].item():.4f}, "
+                  f"cyc: {gen_losses['cycle'].item():.4f}, "
+                  f"id: {gen_losses['identity'].item():.4f}) | "
+                  f"D_loss: {(disc_A_loss.item() + disc_B_loss.item())/2:.4f} "
+                  f"(A: {disc_A_loss.item():.4f}, B: {disc_B_loss.item():.4f})")
             last_progress_time = current_time
         
         # Log to WandB every N steps (reduced frequency for better performance)
@@ -485,6 +622,9 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
                                  epoch, step, wandb.run.name if wandb.run else "training")
                 except Exception as e:
                     print(f"Warning: Image logging failed: {e}. Continuing training...")
+    
+    # Print newline after progress bar
+    print()
     
     # Average losses over epoch
     for key in epoch_losses:
@@ -560,6 +700,243 @@ def plot_loss_curves(losses_history):
         if fig is not None:
             plt.close(fig)
         raise e
+
+
+def calculate_ssim_batch(real_images, generated_images):
+    """
+    Calculate SSIM (Structural Similarity Index) between real and generated images
+    Higher is better (max 1.0, means identical)
+    
+    SSIM measures structural similarity - good for checking if structure is preserved
+    """
+    ssim_scores = []
+    
+    for i in range(real_images.shape[0]):
+        real_img = tensor_to_image(real_images[i])
+        gen_img = tensor_to_image(generated_images[i])
+        
+        # SSIM requires images in [0, 1] range
+        score = ssim(real_img, gen_img, multichannel=True, channel_axis=2, data_range=1.0)
+        ssim_scores.append(score)
+    
+    return np.mean(ssim_scores)
+
+
+def calculate_psnr_batch(real_images, generated_images):
+    """
+    Calculate PSNR (Peak Signal-to-Noise Ratio) between real and generated images
+    Higher is better (typically 20-40 dB is good)
+    
+    PSNR measures pixel-level similarity - good for reconstruction quality
+    """
+    psnr_scores = []
+    
+    for i in range(real_images.shape[0]):
+        real_img = tensor_to_image(real_images[i])
+        gen_img = tensor_to_image(generated_images[i])
+        
+        # PSNR requires images in [0, 1] range
+        score = psnr(real_img, gen_img, data_range=1.0)
+        psnr_scores.append(score)
+    
+    return np.mean(psnr_scores)
+
+
+def calculate_l1_distance(real_images, generated_images):
+    """
+    Calculate L1 (Mean Absolute Error) distance
+    Lower is better (0 means identical)
+    
+    Simple but effective metric for pixel-wise differences
+    """
+    return torch.mean(torch.abs(real_images - generated_images)).item()
+
+
+def calculate_color_histogram_distance(real_images, generated_images):
+    """
+    Calculate color histogram distance between real and generated images
+    Measures how well color distribution is preserved
+    Lower is better (0 means identical distribution)
+    """
+    def get_histogram(image_tensor):
+        """Get normalized color histogram"""
+        # Convert to numpy and ensure [0, 1] range
+        img = tensor_to_image(image_tensor)
+        # Compute histograms for each channel
+        hist_r, _ = np.histogram(img[:,:,0], bins=256, range=(0, 1))
+        hist_g, _ = np.histogram(img[:,:,1], bins=256, range=(0, 1))
+        hist_b, _ = np.histogram(img[:,:,2], bins=256, range=(0, 1))
+        # Concatenate and normalize
+        hist = np.concatenate([hist_r, hist_g, hist_b])
+        hist = hist / (hist.sum() + 1e-8)
+        return hist
+    
+    distances = []
+    for i in range(real_images.shape[0]):
+        real_hist = get_histogram(real_images[i])
+        gen_hist = get_histogram(generated_images[i])
+        # Use chi-squared distance
+        distance = np.sum((real_hist - gen_hist) ** 2 / (real_hist + gen_hist + 1e-8))
+        distances.append(distance)
+    
+    return np.mean(distances)
+
+
+def calculate_diversity_score(generated_images):
+    """
+    Calculate diversity score - measures variety in generated images
+    Higher is better (means no mode collapse)
+    
+    Mode collapse = all outputs look the same (bad!)
+    """
+    # Calculate pairwise L2 distances between all generated images
+    batch_size = generated_images.shape[0]
+    
+    if batch_size < 2:
+        return 0.0
+    
+    # Flatten images
+    flat_images = generated_images.view(batch_size, -1)
+    
+    # Calculate pairwise distances
+    distances = []
+    for i in range(batch_size):
+        for j in range(i + 1, batch_size):
+            dist = torch.norm(flat_images[i] - flat_images[j], p=2).item()
+            distances.append(dist)
+    
+    return np.mean(distances) if distances else 0.0
+
+
+def evaluate_model(gen_A2B, gen_B2A, dataloader, device, num_samples=50):
+    """
+    Comprehensive evaluation of the model
+    
+    Returns dictionary of metrics:
+    - SSIM: Structural similarity (reconstruction quality)
+    - PSNR: Peak signal-to-noise ratio (reconstruction quality)
+    - L1: Mean absolute error (pixel-wise similarity)
+    - Color Distance: Color distribution similarity
+    - Diversity: Variety in outputs (mode collapse detection)
+    """
+    gen_A2B.eval()
+    gen_B2A.eval()
+    
+    metrics = {
+        'ssim_A2B2A': [],  # Photo -> Monet -> Photo reconstruction
+        'ssim_B2A2B': [],  # Monet -> Photo -> Monet reconstruction
+        'psnr_A2B2A': [],
+        'psnr_B2A2B': [],
+        'l1_A2B2A': [],
+        'l1_B2A2B': [],
+        'color_dist_A2B': [],
+        'color_dist_B2A': [],
+        'diversity_A2B': [],
+        'diversity_B2A': [],
+    }
+    
+    samples_processed = 0
+    all_fake_B = []
+    all_fake_A = []
+    
+    with torch.no_grad():
+        for real_A, real_B in dataloader:
+            if samples_processed >= num_samples:
+                break
+            
+            real_A = real_A.to(device)
+            real_B = real_B.to(device)
+            
+            # Generate transformations
+            fake_B = gen_A2B(real_A)  # Photo -> Monet
+            fake_A = gen_B2A(real_B)  # Monet -> Photo
+            
+            # Cycle reconstructions
+            rec_A = gen_B2A(fake_B)  # Photo -> Monet -> Photo
+            rec_B = gen_A2B(fake_A)  # Monet -> Photo -> Monet
+            
+            # Calculate metrics
+            try:
+                # Reconstruction quality (how well can we get back to original?)
+                metrics['ssim_A2B2A'].append(calculate_ssim_batch(real_A, rec_A))
+                metrics['ssim_B2A2B'].append(calculate_ssim_batch(real_B, rec_B))
+                
+                metrics['psnr_A2B2A'].append(calculate_psnr_batch(real_A, rec_A))
+                metrics['psnr_B2A2B'].append(calculate_psnr_batch(real_B, rec_B))
+                
+                metrics['l1_A2B2A'].append(calculate_l1_distance(real_A, rec_A))
+                metrics['l1_B2A2B'].append(calculate_l1_distance(real_B, rec_B))
+                
+                # Color preservation
+                metrics['color_dist_A2B'].append(calculate_color_histogram_distance(real_A, fake_B))
+                metrics['color_dist_B2A'].append(calculate_color_histogram_distance(real_B, fake_A))
+                
+                # Store for diversity calculation
+                all_fake_B.append(fake_B)
+                all_fake_A.append(fake_A)
+                
+            except Exception as e:
+                print(f"Warning: Error calculating metrics: {e}")
+                continue
+            
+            samples_processed += real_A.shape[0]
+    
+    # Calculate diversity (mode collapse detection)
+    if len(all_fake_B) > 1:
+        all_fake_B_tensor = torch.cat(all_fake_B[:10], dim=0)  # Use first 10 batches
+        all_fake_A_tensor = torch.cat(all_fake_A[:10], dim=0)
+        metrics['diversity_A2B'] = [calculate_diversity_score(all_fake_B_tensor)]
+        metrics['diversity_B2A'] = [calculate_diversity_score(all_fake_A_tensor)]
+    
+    # Average all metrics
+    averaged_metrics = {}
+    for key, values in metrics.items():
+        if len(values) > 0:
+            averaged_metrics[key] = np.mean(values)
+        else:
+            averaged_metrics[key] = 0.0
+    
+    gen_A2B.train()
+    gen_B2A.train()
+    
+    return averaged_metrics
+
+
+def log_evaluation_metrics(metrics, epoch):
+    """
+    Log evaluation metrics to WandB with nice formatting
+    """
+    # Log to WandB
+    wandb.log({
+        # Reconstruction quality (higher is better for SSIM/PSNR, lower is better for L1)
+        "eval/ssim_reconstruction_A": metrics['ssim_A2B2A'],
+        "eval/ssim_reconstruction_B": metrics['ssim_B2A2B'],
+        "eval/psnr_reconstruction_A": metrics['psnr_A2B2A'],
+        "eval/psnr_reconstruction_B": metrics['psnr_B2A2B'],
+        "eval/l1_reconstruction_A": metrics['l1_A2B2A'],
+        "eval/l1_reconstruction_B": metrics['l1_B2A2B'],
+        
+        # Color preservation (lower is better)
+        "eval/color_distance_A2B": metrics['color_dist_A2B'],
+        "eval/color_distance_B2A": metrics['color_dist_B2A'],
+        
+        # Diversity (higher is better - no mode collapse)
+        "eval/diversity_A2B": metrics['diversity_A2B'],
+        "eval/diversity_B2A": metrics['diversity_B2A'],
+        
+        "epoch": epoch,
+    })
+    
+    # Print summary
+    print(f"\n  📊 Evaluation Metrics (Epoch {epoch+1}):")
+    print(f"     Reconstruction Quality:")
+    print(f"       SSIM: A={metrics['ssim_A2B2A']:.4f}, B={metrics['ssim_B2A2B']:.4f} (higher=better, max=1.0)")
+    print(f"       PSNR: A={metrics['psnr_A2B2A']:.2f}dB, B={metrics['psnr_B2A2B']:.2f}dB (higher=better)")
+    print(f"       L1:   A={metrics['l1_A2B2A']:.4f}, B={metrics['l1_B2A2B']:.4f} (lower=better)")
+    print(f"     Color Preservation:")
+    print(f"       Distance: A→B={metrics['color_dist_A2B']:.4f}, B→A={metrics['color_dist_B2A']:.4f} (lower=better)")
+    print(f"     Mode Collapse Check:")
+    print(f"       Diversity: A→B={metrics['diversity_A2B']:.2f}, B→A={metrics['diversity_B2A']:.2f} (higher=better)")
 
 
 # Global variables for signal handler
@@ -670,7 +1047,7 @@ def train(args):
     # Use Automatic Mixed Precision (AMP) for faster training and lower memory usage
     # This can speed up training by 1.5-2x on modern GPUs
     use_amp = args.use_amp and torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     if use_amp:
         print("Mixed Precision Training (AMP) enabled - faster training!")
     
@@ -700,15 +1077,18 @@ def train(args):
     # ==================== Setup Image Output Directory ====================
     # Save images for comparison across epochs (for your tutor's graphs!)
     fixed_image_pairs_original = None  # Store original images for consistent comparison
-    # Set image save frequency (default to checkpoint_freq if not specified)
-    image_save_freq = args.image_save_freq if args.image_save_freq is not None else args.checkpoint_freq
+    # Set image save frequency (defaults to 1 if not specified, meaning every epoch)
+    image_save_freq = args.image_save_freq
     
     if args.save_images:
         if args.image_output_dir is None:
             args.image_output_dir = os.path.join(args.checkpoint_dir, "images", args.experiment_name)
         os.makedirs(args.image_output_dir, exist_ok=True)
         print(f"   Images will be saved to: {args.image_output_dir}")
-        print(f"   Images saved at epochs: every {image_save_freq} epochs")
+        if image_save_freq == 1:
+            print(f"   Images saved: EVERY epoch (more frequent for better tracking!)")
+        else:
+            print(f"   Images saved at epochs: every {image_save_freq} epochs")
         print(f"   Saving 5 fixed photo->painting pairs for consistent comparison")
         
         # Get 5 fixed image pairs at the start (same images used across all epochs)
@@ -771,7 +1151,9 @@ def train(args):
     try:
         for epoch in range(start_epoch, args.epochs):
             current_epoch = epoch
-            print(f"\nEpoch {epoch+1}/{args.epochs}")
+            print(f"\n{'='*70}")
+            print(f"🎨 Epoch {epoch+1}/{args.epochs}")
+            print(f"{'='*70}")
             epoch_start_time = time.time()
             
             try:
@@ -831,8 +1213,19 @@ def train(args):
                             
                             # Save the 5 fixed pairs
                             save_fixed_image_pairs(fixed_pairs_results, epoch, args.experiment_name, args.image_output_dir)
+                            print(f"     💾 Images saved for epoch {epoch+1}")
                         except Exception as e:
-                            print(f"Warning: Failed to save fixed image pairs: {e}. Continuing...")
+                            print(f"     ⚠️  Warning: Failed to save fixed image pairs: {e}. Continuing...")
+                
+                # Run comprehensive evaluation every N epochs
+                eval_freq = args.eval_freq if args.eval_freq is not None else args.checkpoint_freq
+                if (epoch + 1) % eval_freq == 0 or (epoch + 1) == args.epochs or epoch == start_epoch:
+                    try:
+                        print(f"\n  🔍 Running comprehensive evaluation...")
+                        eval_metrics = evaluate_model(gen_A2B, gen_B2A, dataloader, device, num_samples=args.eval_samples)
+                        log_evaluation_metrics(eval_metrics, epoch)
+                    except Exception as e:
+                        print(f"     ⚠️  Warning: Evaluation failed: {e}. Continuing training...")
                 
                 # Save checkpoint every epoch as backup (quick recovery)
                 try:
@@ -860,10 +1253,14 @@ def train(args):
                         # Don't raise - we already have latest.pth
                 
                 epoch_time = time.time() - epoch_start_time
-                print(f"   Generator Loss: {epoch_losses['gen_total']:.4f}")
-                print(f"   Discriminator A Loss: {epoch_losses['disc_A']:.4f}")
-                print(f"   Discriminator B Loss: {epoch_losses['disc_B']:.4f}")
-                print(f"   Epoch time: {epoch_time/60:.1f} minutes")
+                mins, secs = divmod(int(epoch_time), 60)
+                print(f"\n  ✅ Epoch {epoch+1}/{args.epochs} completed in {mins}m {secs}s")
+                print(f"     Generator Loss: {epoch_losses['gen_total']:.4f} "
+                      f"(adv: {epoch_losses['gen_adv']:.4f}, "
+                      f"cyc: {epoch_losses['gen_cycle']:.4f}, "
+                      f"id: {epoch_losses['gen_identity']:.4f})")
+                print(f"     Discriminator Loss: A={epoch_losses['disc_A']:.4f}, B={epoch_losses['disc_B']:.4f}, "
+                      f"avg={((epoch_losses['disc_A'] + epoch_losses['disc_B'])/2):.4f}")
                 
             except KeyboardInterrupt:
                 print("\n\n⚠️  Training interrupted by user!")
@@ -951,8 +1348,14 @@ if __name__ == "__main__":
                        help="Save generated images to disk for comparison across epochs (default: True)")
     parser.add_argument("--image_output_dir", type=str, default=None,
                        help="Base directory to save generated images (default: checkpoint_dir/images/experiment_name). Images are organized by epoch in subdirectories.")
-    parser.add_argument("--image_save_freq", type=int, default=None,
-                       help="Save images every N epochs (default: same as checkpoint_freq)")
+    parser.add_argument("--image_save_freq", type=int, default=1,
+                       help="Save images every N epochs (default: 1, meaning every epoch)")
+    
+    # Evaluation arguments
+    parser.add_argument("--eval_freq", type=int, default=None,
+                       help="Run comprehensive evaluation every N epochs (default: same as checkpoint_freq)")
+    parser.add_argument("--eval_samples", type=int, default=50,
+                       help="Number of samples to use for evaluation metrics (default: 50)")
     
     # WandB arguments
     parser.add_argument("--project_name", type=str, default="cyclegan-experiments",
