@@ -528,10 +528,20 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         # Backward pass with mixed precision support
         if use_amp:
             scaler.scale(gen_total).backward()
+            # Calculate gradient norms before optimizer step (for monitoring)
+            gen_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(gen_A2B.parameters()) + list(gen_B2A.parameters()), 
+                max_norm=float('inf')  # Don't actually clip, just measure
+            )
             scaler.step(optimizer_G)
             scaler.update()
         else:
             gen_total.backward()
+            # Calculate gradient norms before optimizer step (for monitoring)
+            gen_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(gen_A2B.parameters()) + list(gen_B2A.parameters()), 
+                max_norm=float('inf')  # Don't actually clip, just measure
+            )
             optimizer_G.step()
         
         # ==================== Train Discriminators ====================
@@ -561,10 +571,20 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         
         if use_amp:
             scaler.scale(disc_B_loss).backward()
+            # Calculate discriminator gradient norms
+            disc_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(disc_A.parameters()) + list(disc_B.parameters()), 
+                max_norm=float('inf')  # Don't actually clip, just measure
+            )
             scaler.step(optimizer_D)
             scaler.update()
         else:
             disc_B_loss.backward()
+            # Calculate discriminator gradient norms
+            disc_grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(disc_A.parameters()) + list(disc_B.parameters()), 
+                max_norm=float('inf')  # Don't actually clip, just measure
+            )
             optimizer_D.step()
         
         # Accumulate losses
@@ -602,15 +622,55 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         
         if step % log_freq == 0:
             try:
+                # Calculate additional metrics
+                disc_avg = (disc_A_loss.item() + disc_B_loss.item()) / 2
+                gen_disc_ratio = gen_total.item() / (disc_avg + 1e-8)
+                
+                # Calculate discriminator accuracy (how well it distinguishes real vs fake)
+                with torch.no_grad():
+                    # For real images, discriminator should output high values (close to 1)
+                    # For fake images, discriminator should output low values (close to 0 or negative)
+                    real_A_acc = (real_A_pred > 0).float().mean().item()
+                    fake_A_acc = (fake_A_pred_detached < 0).float().mean().item()
+                    real_B_acc = (real_B_pred > 0).float().mean().item()
+                    fake_B_acc = (fake_B_pred_detached < 0).float().mean().item()
+                    
+                    disc_A_acc = (real_A_acc + fake_A_acc) / 2
+                    disc_B_acc = (real_B_acc + fake_B_acc) / 2
+                
                 wandb.log({
+                    # Basic losses
                     "loss/gen_total": gen_total.item(),
                     "loss/gen_adv": gen_losses['adversarial'].item(),
                     "loss/gen_cycle": gen_losses['cycle'].item(),
                     "loss/gen_identity": gen_losses['identity'].item(),
                     "loss/disc_A": disc_A_loss.item(),
                     "loss/disc_B": disc_B_loss.item(),
+                    "loss/disc_avg": disc_avg,
+                    
+                    # Loss ratios (for balance monitoring)
+                    "ratio/gen_to_disc": gen_disc_ratio,
+                    "ratio/adv_to_cycle": gen_losses['adversarial'].item() / (gen_losses['cycle'].item() + 1e-8),
+                    "ratio/cycle_to_identity": gen_losses['cycle'].item() / (gen_losses['identity'].item() + 1e-8),
+                    
+                    # Discriminator performance
+                    "disc_accuracy/disc_A": disc_A_acc,
+                    "disc_accuracy/disc_B": disc_B_acc,
+                    "disc_accuracy/disc_avg": (disc_A_acc + disc_B_acc) / 2,
+                    "disc_accuracy/real_A": real_A_acc,
+                    "disc_accuracy/fake_A": fake_A_acc,
+                    "disc_accuracy/real_B": real_B_acc,
+                    "disc_accuracy/fake_B": fake_B_acc,
+                    
+                    # Gradient norms (training stability)
+                    "gradients/gen_grad_norm": gen_grad_norm.item() if isinstance(gen_grad_norm, torch.Tensor) else gen_grad_norm,
+                    "gradients/disc_grad_norm": disc_grad_norm.item() if isinstance(disc_grad_norm, torch.Tensor) else disc_grad_norm,
+                    "gradients/grad_ratio": (gen_grad_norm / (disc_grad_norm + 1e-8)).item() if isinstance(gen_grad_norm, torch.Tensor) else (gen_grad_norm / (disc_grad_norm + 1e-8)),
+                    
+                    # Training progress
                     "epoch": epoch,
                     "step": epoch * num_batches + step,
+                    "progress": (epoch * num_batches + step) / (args.epochs * num_batches),
                 })
             except Exception as e:
                 print(f"Warning: WandB logging failed: {e}. Continuing training...")
