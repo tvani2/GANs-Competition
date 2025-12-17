@@ -35,7 +35,7 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 
 # Import your models and losses
-from models import ResNetGenerator, UNetGenerator, PatchGANDiscriminator
+from models import ResNetGenerator, PatchGANDiscriminator
 from losses.losses_cyclegan_lsgan import CycleGANLossesLSGAN  # LSGAN loss instead of Hinge
 
 
@@ -541,11 +541,11 @@ def train(args):
     if args.architecture == 'resnet':
         gen_A2B = ResNetGenerator(input_nc=3, output_nc=3, ngf=64, n_blocks=9).to(device)
         gen_B2A = ResNetGenerator(input_nc=3, output_nc=3, ngf=64, n_blocks=9).to(device)
-    elif args.architecture == 'unet':
-        gen_A2B = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
-        gen_B2A = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
+    # elif args.architecture == 'unet':
+    #     gen_A2B = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
+    #     gen_B2A = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
     else:
-        raise ValueError(f"Unknown architecture: {args.architecture}")
+        raise ValueError(f"Unknown architecture: {args.architecture}. Only 'resnet' is currently supported.")
     
     disc_A = PatchGANDiscriminator(input_nc=3, ndf=64).to(device)
     disc_B = PatchGANDiscriminator(input_nc=3, ndf=64).to(device)
