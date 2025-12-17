@@ -1,11 +1,17 @@
 """
-CycleGAN Training Script with WandB Integration
+CycleGAN Training Script with LSGAN Loss and WandB Integration
 
-This script trains CycleGAN models with:
+This script trains CycleGAN models with LSGAN (Least Squares GAN) loss:
+- LSGAN adversarial loss (smoother gradients, better quality)
 - WandB logging for metrics, images, and model artifacts
 - Checkpoint saving to Google Drive
 - Experiment management (changing one variable at a time)
 - Resuming training from checkpoints
+
+Key Difference from train_cyclegan.py:
+- Uses LSGAN loss instead of Hinge loss
+- LSGAN: (D(x) - 1)² for real, D(x)² for fake
+- Provides smoother gradients and potentially better image quality
 """
 
 import os
@@ -30,7 +36,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 
 # Import your models and losses
 from models import ResNetGenerator, UNetGenerator, PatchGANDiscriminator
-from losses.losses_cyclegan import CycleGANLosses
+from losses.losses_cyclegan_lsgan import CycleGANLossesLSGAN  # LSGAN loss instead of Hinge
 
 
 class ImageDataset(torch.utils.data.Dataset):
@@ -266,204 +272,31 @@ def log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, epoch, step,
         raise e
 
 
-def save_checkpoint(epoch, gen_A2B, gen_B2A, disc_A, disc_B, 
-                   optimizer_G, optimizer_D, losses_history, checkpoint_dir, 
-                   experiment_name, save_latest=False):
-    """
-    Save complete checkpoint to Google Drive using atomic writes to prevent corruption
-    
-    Args:
-        save_latest: If True, also save as 'latest.pth' for quick recovery
-    """
-    import tempfile
-    import shutil
-    
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    checkpoint_path = os.path.join(checkpoint_dir, 
-                                   f'{experiment_name}_epoch_{epoch}.pth')
-    
-    checkpoint = {
-        'epoch': epoch,
-        'experiment_name': experiment_name,
-        'gen_A2B_state_dict': gen_A2B.state_dict(),
-        'gen_B2A_state_dict': gen_B2A.state_dict(),
-        'disc_A_state_dict': disc_A.state_dict(),
-        'disc_B_state_dict': disc_B.state_dict(),
-        'optimizer_G_state_dict': optimizer_G.state_dict(),
-        'optimizer_D_state_dict': optimizer_D.state_dict(),
-        'losses_history': losses_history,
-    }
-    
-    def atomic_save(target_path, checkpoint_data):
-        """Save checkpoint atomically using temp file + rename to prevent corruption"""
-        # Create temp file in the same directory (important for atomic rename)
-        temp_fd, temp_path = tempfile.mkstemp(
-            dir=os.path.dirname(target_path),
-            prefix='.tmp_checkpoint_',
-            suffix='.pth'
-        )
-        
-        try:
-            # Close the file descriptor, we'll use torch.save
-            os.close(temp_fd)
-            
-            # Save to temp file
-            torch.save(checkpoint_data, temp_path)
-            
-            # Verify the file was written correctly by checking size
-            file_size = os.path.getsize(temp_path)
-            if file_size < 1024:  # Less than 1KB is suspicious
-                raise ValueError(f"Saved checkpoint is too small ({file_size} bytes), likely corrupted")
-            
-            # Atomic rename (on same filesystem this is atomic)
-            # Note: On Windows/Drive, we need to remove target first if it exists
-            if os.path.exists(target_path):
-                try:
-                    os.remove(target_path)
-                except:
-                    pass  # Ignore if file doesn't exist or can't be removed
-            
-            shutil.move(temp_path, target_path)
-            
-            return file_size
-            
-        except Exception as e:
-            # Clean up temp file if something went wrong
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-            raise e
-    
-    try:
-        # Save main checkpoint with atomic write
-        file_size = atomic_save(checkpoint_path, checkpoint)
-        print(f"✅ Checkpoint saved: {checkpoint_path} ({file_size / (1024*1024):.2f} MB)")
-        
-        # Also save as 'latest.pth' for quick recovery
-        if save_latest:
-            latest_path = os.path.join(checkpoint_dir, f'{experiment_name}_latest.pth')
-            file_size_latest = atomic_save(latest_path, checkpoint)
-            print(f"✅ Latest checkpoint saved: {latest_path} ({file_size_latest / (1024*1024):.2f} MB)")
-        
-        # Also save to WandB as artifact (non-blocking, with error handling)
-        try:
-            artifact = wandb.Artifact(f'{experiment_name}-epoch-{epoch}', type='model')
-            artifact.add_file(checkpoint_path)
-            wandb.log_artifact(artifact)
-        except Exception as e:
-            print(f"⚠️  Warning: Failed to save to WandB: {e}")
-            print("   Checkpoint saved locally, continuing training...")
-        
-    except Exception as e:
-        print(f"❌ ERROR: Failed to save checkpoint: {e}")
-        raise
-    
-    return checkpoint_path
+# Import all other functions from train_cyclegan.py
+# (save_checkpoint, load_checkpoint, train_epoch, etc.)
+# For brevity, I'll import them from the original file
 
-
-def load_checkpoint(checkpoint_path, gen_A2B, gen_B2A, disc_A, disc_B, 
-                    optimizer_G, optimizer_D, device):
-    """
-    Load checkpoint and resume training with validation and error recovery
-    """
-    print(f"📂 Loading checkpoint: {checkpoint_path}")
-    
-    # Check if file exists
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
-    
-    # Check file size
-    file_size = os.path.getsize(checkpoint_path)
-    if file_size < 1024:  # Less than 1KB is suspicious
-        raise ValueError(
-            f"Checkpoint file appears corrupted (size: {file_size} bytes). "
-            f"File is too small to be a valid checkpoint."
-        )
-    
-    print(f"   File size: {file_size / (1024*1024):.2f} MB")
-    
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    except (RuntimeError, EOFError, Exception) as e:
-        error_msg = str(e).lower()
-        if "failed finding central directory" in error_msg or "zip archive" in error_msg or "unexpected eof" in error_msg:
-            # Get directory of checkpoint to suggest alternatives
-            checkpoint_dir = os.path.dirname(checkpoint_path)
-            checkpoint_name = os.path.basename(checkpoint_path)
-            
-            print(f"\n❌ Checkpoint file is corrupted!")
-            print(f"   File: {checkpoint_path}")
-            print(f"   Size: {file_size / (1024*1024):.2f} MB")
-            print(f"   Error: {e}\n")
-            
-            # Try to find alternative checkpoints
-            print("🔍 Scanning for valid alternative checkpoints...")
-            alternative_checkpoints = []
-            
-            if os.path.exists(checkpoint_dir):
-                all_files = sorted(os.listdir(checkpoint_dir), reverse=True)
-                # Look for other epoch checkpoints
-                for f in all_files:
-                    if f.endswith('.pth') and f != checkpoint_name:
-                        alt_path = os.path.join(checkpoint_dir, f)
-                        try:
-                            alt_size = os.path.getsize(alt_path)
-                            # Quick validation: check size
-                            if alt_size > 1024 * 100:  # At least 100KB
-                                # Try to load it
-                                test_ckpt = torch.load(alt_path, map_location='cpu', weights_only=False)
-                                if 'epoch' in test_ckpt:
-                                    epoch_num = test_ckpt['epoch']
-                                    print(f"   ✅ Found valid: {f} (epoch {epoch_num}, {alt_size / (1024*1024):.2f} MB)")
-                                    alternative_checkpoints.append((f, alt_path, epoch_num))
-                                    if len(alternative_checkpoints) >= 3:
-                                        break
-                            else:
-                                print(f"   ⚠️  Too small: {f} ({alt_size} bytes)")
-                        except Exception:
-                            print(f"   ❌ Invalid: {f}")
-            
-            if alternative_checkpoints:
-                print(f"\n✅ Found {len(alternative_checkpoints)} valid checkpoint(s)!")
-                print(f"\n📋 To resume training, use one of these:\n")
-                for alt_name, alt_path, epoch in alternative_checkpoints:
-                    print(f"   --resume_from \"{alt_path}\"")
-                print()
-            else:
-                print(f"\n❌ No valid checkpoints found in: {checkpoint_dir}")
-                print(f"   You may need to start training from scratch.\n")
-            
-            raise RuntimeError(f"Checkpoint corrupted. See suggestions above.") from e
-        else:
-            raise
-    
-    # Load model weights
-    gen_A2B.load_state_dict(checkpoint['gen_A2B_state_dict'])
-    gen_B2A.load_state_dict(checkpoint['gen_B2A_state_dict'])
-    disc_A.load_state_dict(checkpoint['disc_A_state_dict'])
-    disc_B.load_state_dict(checkpoint['disc_B_state_dict'])
-    
-    # Load optimizer states
-    optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
-    optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
-    
-    # Return starting epoch and experiment name
-    start_epoch = checkpoint['epoch'] + 1
-    experiment_name = checkpoint.get('experiment_name', 'unknown')
-    losses_history = checkpoint.get('losses_history', [])
-    
-    print(f"✅ Checkpoint loaded. Resuming from epoch {start_epoch}")
-    
-    return start_epoch, experiment_name, losses_history
+# Import shared functions
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from train_cyclegan import (
+    save_checkpoint,
+    load_checkpoint,
+    plot_loss_curves,
+    calculate_ssim_batch,
+    calculate_psnr_batch,
+    calculate_l1_distance,
+    calculate_color_histogram_distance,
+    calculate_diversity_score,
+    evaluate_model,
+    log_evaluation_metrics,
+)
 
 
 def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader, 
                 optimizer_G, optimizer_D, losses_fn, device, epoch, scaler=None):
     """
-    Train for one epoch
+    Train for one epoch with LSGAN loss
     """
     gen_A2B.train()
     gen_B2A.train()
@@ -516,7 +349,7 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
             fake_B_pred = disc_B(fake_B)
             fake_A_pred = disc_A(fake_A)
             
-            # Generator losses
+            # Generator losses (LSGAN)
             gen_losses = losses_fn.generator_loss(
                 fake_A_pred, fake_B_pred,
                 real_A, rec_A, real_B, rec_B,
@@ -633,312 +466,6 @@ def train_epoch(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
     return epoch_losses, (real_A, fake_B, rec_A, real_B, fake_A, rec_B)
 
 
-def plot_loss_curves(losses_history):
-    """
-    Create and log loss curves plot to WandB
-    """
-    fig = None
-    try:
-        epochs = [l['epoch'] for l in losses_history]
-        
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.patch.set_facecolor('white')
-        
-        # Generator losses
-        axes[0, 0].plot(epochs, [l['gen_total'] for l in losses_history], 
-                       'b-', linewidth=2, label='Total')
-        axes[0, 0].plot(epochs, [l['gen_adv'] for l in losses_history], 
-                       'r--', linewidth=1.5, alpha=0.7, label='Adversarial')
-        axes[0, 0].plot(epochs, [l['gen_cycle'] for l in losses_history], 
-                       'g--', linewidth=1.5, alpha=0.7, label='Cycle')
-        axes[0, 0].set_xlabel('Epoch', fontsize=12)
-        axes[0, 0].set_ylabel('Loss', fontsize=12)
-        axes[0, 0].set_title('Generator Losses', fontsize=14, fontweight='bold')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Discriminator losses
-        axes[0, 1].plot(epochs, [l['disc_A'] for l in losses_history], 
-                       'orange', linewidth=2, label='Disc A')
-        axes[0, 1].plot(epochs, [l['disc_B'] for l in losses_history], 
-                       'purple', linewidth=2, label='Disc B')
-        axes[0, 1].set_xlabel('Epoch', fontsize=12)
-        axes[0, 1].set_ylabel('Loss', fontsize=12)
-        axes[0, 1].set_title('Discriminator Losses', fontsize=14, fontweight='bold')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Combined plot
-        axes[1, 0].plot(epochs, [l['gen_total'] for l in losses_history], 
-                       'b-', linewidth=2, label='Generator Total')
-        axes[1, 0].plot(epochs, [(l['disc_A'] + l['disc_B'])/2 for l in losses_history], 
-                       'r-', linewidth=2, label='Discriminator Avg')
-        axes[1, 0].set_xlabel('Epoch', fontsize=12)
-        axes[1, 0].set_ylabel('Loss', fontsize=12)
-        axes[1, 0].set_title('Generator vs Discriminator', fontsize=14, fontweight='bold')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Component breakdown
-        axes[1, 1].plot(epochs, [l['gen_adv'] for l in losses_history], 
-                       label='Adversarial', linewidth=2)
-        axes[1, 1].plot(epochs, [l['gen_cycle'] for l in losses_history], 
-                       label='Cycle', linewidth=2)
-        axes[1, 1].plot(epochs, [l['gen_identity'] for l in losses_history], 
-                       label='Identity', linewidth=2)
-        axes[1, 1].set_xlabel('Epoch', fontsize=12)
-        axes[1, 1].set_ylabel('Loss', fontsize=12)
-        axes[1, 1].set_title('Generator Loss Components', fontsize=14, fontweight='bold')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        wandb.log({"plots/loss_curves": wandb.Image(fig)})
-        plt.close(fig)
-        fig = None
-    except Exception as e:
-        if fig is not None:
-            plt.close(fig)
-        raise e
-
-
-def calculate_ssim_batch(real_images, generated_images):
-    """
-    Calculate SSIM (Structural Similarity Index) between real and generated images
-    Higher is better (max 1.0, means identical)
-    
-    SSIM measures structural similarity - good for checking if structure is preserved
-    """
-    ssim_scores = []
-    
-    for i in range(real_images.shape[0]):
-        real_img = tensor_to_image(real_images[i])
-        gen_img = tensor_to_image(generated_images[i])
-        
-        # SSIM requires images in [0, 1] range
-        score = ssim(real_img, gen_img, multichannel=True, channel_axis=2, data_range=1.0)
-        ssim_scores.append(score)
-    
-    return np.mean(ssim_scores)
-
-
-def calculate_psnr_batch(real_images, generated_images):
-    """
-    Calculate PSNR (Peak Signal-to-Noise Ratio) between real and generated images
-    Higher is better (typically 20-40 dB is good)
-    
-    PSNR measures pixel-level similarity - good for reconstruction quality
-    """
-    psnr_scores = []
-    
-    for i in range(real_images.shape[0]):
-        real_img = tensor_to_image(real_images[i])
-        gen_img = tensor_to_image(generated_images[i])
-        
-        # PSNR requires images in [0, 1] range
-        score = psnr(real_img, gen_img, data_range=1.0)
-        psnr_scores.append(score)
-    
-    return np.mean(psnr_scores)
-
-
-def calculate_l1_distance(real_images, generated_images):
-    """
-    Calculate L1 (Mean Absolute Error) distance
-    Lower is better (0 means identical)
-    
-    Simple but effective metric for pixel-wise differences
-    """
-    return torch.mean(torch.abs(real_images - generated_images)).item()
-
-
-def calculate_color_histogram_distance(real_images, generated_images):
-    """
-    Calculate color histogram distance between real and generated images
-    Measures how well color distribution is preserved
-    Lower is better (0 means identical distribution)
-    """
-    def get_histogram(image_tensor):
-        """Get normalized color histogram"""
-        # Convert to numpy and ensure [0, 1] range
-        img = tensor_to_image(image_tensor)
-        # Compute histograms for each channel
-        hist_r, _ = np.histogram(img[:,:,0], bins=256, range=(0, 1))
-        hist_g, _ = np.histogram(img[:,:,1], bins=256, range=(0, 1))
-        hist_b, _ = np.histogram(img[:,:,2], bins=256, range=(0, 1))
-        # Concatenate and normalize
-        hist = np.concatenate([hist_r, hist_g, hist_b])
-        hist = hist / (hist.sum() + 1e-8)
-        return hist
-    
-    distances = []
-    for i in range(real_images.shape[0]):
-        real_hist = get_histogram(real_images[i])
-        gen_hist = get_histogram(generated_images[i])
-        # Use chi-squared distance
-        distance = np.sum((real_hist - gen_hist) ** 2 / (real_hist + gen_hist + 1e-8))
-        distances.append(distance)
-    
-    return np.mean(distances)
-
-
-def calculate_diversity_score(generated_images):
-    """
-    Calculate diversity score - measures variety in generated images
-    Higher is better (means no mode collapse)
-    
-    Mode collapse = all outputs look the same (bad!)
-    """
-    # Calculate pairwise L2 distances between all generated images
-    batch_size = generated_images.shape[0]
-    
-    if batch_size < 2:
-        return 0.0
-    
-    # Flatten images
-    flat_images = generated_images.view(batch_size, -1)
-    
-    # Calculate pairwise distances
-    distances = []
-    for i in range(batch_size):
-        for j in range(i + 1, batch_size):
-            dist = torch.norm(flat_images[i] - flat_images[j], p=2).item()
-            distances.append(dist)
-    
-    return np.mean(distances) if distances else 0.0
-
-
-def evaluate_model(gen_A2B, gen_B2A, dataloader, device, num_samples=50):
-    """
-    Comprehensive evaluation of the model
-    
-    Returns dictionary of metrics:
-    - SSIM: Structural similarity (reconstruction quality)
-    - PSNR: Peak signal-to-noise ratio (reconstruction quality)
-    - L1: Mean absolute error (pixel-wise similarity)
-    - Color Distance: Color distribution similarity
-    - Diversity: Variety in outputs (mode collapse detection)
-    """
-    gen_A2B.eval()
-    gen_B2A.eval()
-    
-    metrics = {
-        'ssim_A2B2A': [],  # Photo -> Monet -> Photo reconstruction
-        'ssim_B2A2B': [],  # Monet -> Photo -> Monet reconstruction
-        'psnr_A2B2A': [],
-        'psnr_B2A2B': [],
-        'l1_A2B2A': [],
-        'l1_B2A2B': [],
-        'color_dist_A2B': [],
-        'color_dist_B2A': [],
-        'diversity_A2B': [],
-        'diversity_B2A': [],
-    }
-    
-    samples_processed = 0
-    all_fake_B = []
-    all_fake_A = []
-    
-    with torch.no_grad():
-        for real_A, real_B in dataloader:
-            if samples_processed >= num_samples:
-                break
-            
-            real_A = real_A.to(device)
-            real_B = real_B.to(device)
-            
-            # Generate transformations
-            fake_B = gen_A2B(real_A)  # Photo -> Monet
-            fake_A = gen_B2A(real_B)  # Monet -> Photo
-            
-            # Cycle reconstructions
-            rec_A = gen_B2A(fake_B)  # Photo -> Monet -> Photo
-            rec_B = gen_A2B(fake_A)  # Monet -> Photo -> Monet
-            
-            # Calculate metrics
-            try:
-                # Reconstruction quality (how well can we get back to original?)
-                metrics['ssim_A2B2A'].append(calculate_ssim_batch(real_A, rec_A))
-                metrics['ssim_B2A2B'].append(calculate_ssim_batch(real_B, rec_B))
-                
-                metrics['psnr_A2B2A'].append(calculate_psnr_batch(real_A, rec_A))
-                metrics['psnr_B2A2B'].append(calculate_psnr_batch(real_B, rec_B))
-                
-                metrics['l1_A2B2A'].append(calculate_l1_distance(real_A, rec_A))
-                metrics['l1_B2A2B'].append(calculate_l1_distance(real_B, rec_B))
-                
-                # Color preservation
-                metrics['color_dist_A2B'].append(calculate_color_histogram_distance(real_A, fake_B))
-                metrics['color_dist_B2A'].append(calculate_color_histogram_distance(real_B, fake_A))
-                
-                # Store for diversity calculation
-                all_fake_B.append(fake_B)
-                all_fake_A.append(fake_A)
-                
-            except Exception as e:
-                print(f"Warning: Error calculating metrics: {e}")
-                continue
-            
-            samples_processed += real_A.shape[0]
-    
-    # Calculate diversity (mode collapse detection)
-    if len(all_fake_B) > 1:
-        all_fake_B_tensor = torch.cat(all_fake_B[:10], dim=0)  # Use first 10 batches
-        all_fake_A_tensor = torch.cat(all_fake_A[:10], dim=0)
-        metrics['diversity_A2B'] = [calculate_diversity_score(all_fake_B_tensor)]
-        metrics['diversity_B2A'] = [calculate_diversity_score(all_fake_A_tensor)]
-    
-    # Average all metrics
-    averaged_metrics = {}
-    for key, values in metrics.items():
-        if len(values) > 0:
-            averaged_metrics[key] = np.mean(values)
-        else:
-            averaged_metrics[key] = 0.0
-    
-    gen_A2B.train()
-    gen_B2A.train()
-    
-    return averaged_metrics
-
-
-def log_evaluation_metrics(metrics, epoch):
-    """
-    Log evaluation metrics to WandB with nice formatting
-    """
-    # Log to WandB
-    wandb.log({
-        # Reconstruction quality (higher is better for SSIM/PSNR, lower is better for L1)
-        "eval/ssim_reconstruction_A": metrics['ssim_A2B2A'],
-        "eval/ssim_reconstruction_B": metrics['ssim_B2A2B'],
-        "eval/psnr_reconstruction_A": metrics['psnr_A2B2A'],
-        "eval/psnr_reconstruction_B": metrics['psnr_B2A2B'],
-        "eval/l1_reconstruction_A": metrics['l1_A2B2A'],
-        "eval/l1_reconstruction_B": metrics['l1_B2A2B'],
-        
-        # Color preservation (lower is better)
-        "eval/color_distance_A2B": metrics['color_dist_A2B'],
-        "eval/color_distance_B2A": metrics['color_dist_B2A'],
-        
-        # Diversity (higher is better - no mode collapse)
-        "eval/diversity_A2B": metrics['diversity_A2B'],
-        "eval/diversity_B2A": metrics['diversity_B2A'],
-        
-        "epoch": epoch,
-    })
-    
-    # Print summary
-    print(f"\n  📊 Evaluation Metrics (Epoch {epoch+1}):")
-    print(f"     Reconstruction Quality:")
-    print(f"       SSIM: A={metrics['ssim_A2B2A']:.4f}, B={metrics['ssim_B2A2B']:.4f} (higher=better, max=1.0)")
-    print(f"       PSNR: A={metrics['psnr_A2B2A']:.2f}dB, B={metrics['psnr_B2A2B']:.2f}dB (higher=better)")
-    print(f"       L1:   A={metrics['l1_A2B2A']:.4f}, B={metrics['l1_B2A2B']:.4f} (lower=better)")
-    print(f"     Color Preservation:")
-    print(f"       Distance: A→B={metrics['color_dist_A2B']:.4f}, B→A={metrics['color_dist_B2A']:.4f} (lower=better)")
-    print(f"     Mode Collapse Check:")
-    print(f"       Diversity: A→B={metrics['diversity_A2B']:.2f}, B→A={metrics['diversity_B2A']:.2f} (higher=better)")
-
-
 # Global variables for signal handler
 current_epoch = 0
 current_gen_A2B = None
@@ -954,7 +481,7 @@ current_checkpoint_dir = ""
 
 def train(args):
     """
-    Main training function
+    Main training function with LSGAN loss
     """
     global current_epoch, current_gen_A2B, current_gen_B2A, current_disc_A, current_disc_B
     global current_optimizer_G, current_optimizer_D, current_losses_history
@@ -962,6 +489,7 @@ def train(args):
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    print(f"🎯 Loss type: LSGAN (Least Squares GAN)")
     
     # ==================== Initialize WandB ====================
     wandb.init(
@@ -969,6 +497,7 @@ def train(args):
         name=args.experiment_name,
         config={
             "architecture": args.architecture,
+            "loss_type": "LSGAN",  # Mark this as LSGAN experiment
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "learning_rate": args.lr,
@@ -977,7 +506,7 @@ def train(args):
             "checkpoint_freq": args.checkpoint_freq,
             "resume_from": args.resume_from,
         },
-        tags=[args.architecture, "cyclegan"],
+        tags=[args.architecture, "cyclegan", "lsgan"],  # Add lsgan tag
         settings=wandb.Settings(_disable_stats=False),  # Enable system metrics
     )
     
@@ -997,18 +526,15 @@ def train(args):
     
     dataset = ImageDataset(args.data_A, args.data_B, transform=transform)
     # Optimize DataLoader for faster data loading
-    # num_workers: Use 4-8 for better parallelization (adjust based on CPU cores)
-    # pin_memory: Faster GPU transfer when using CUDA
-    # persistent_workers: Keep workers alive between epochs to avoid recreation overhead
-    num_workers = min(8, os.cpu_count() or 4)  # Use up to 8 workers, or CPU count if less
+    num_workers = min(8, os.cpu_count() or 4)
     dataloader = DataLoader(
         dataset, 
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
-        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
-        prefetch_factor=2 if num_workers > 0 else 2  # Prefetch batches
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else 2
     )
     
     # ==================== Initialize Models ====================
@@ -1037,15 +563,14 @@ def train(args):
         betas=(0.5, 0.999)
     )
     
-    # ==================== Initialize Loss Function ====================
-    losses_fn = CycleGANLosses(
+    # ==================== Initialize Loss Function (LSGAN) ====================
+    losses_fn = CycleGANLossesLSGAN(
         lambda_cycle=args.lambda_cycle,
         lambda_identity=args.lambda_identity
     )
+    print(f"✅ Using LSGAN loss function")
     
     # ==================== Mixed Precision Training ====================
-    # Use Automatic Mixed Precision (AMP) for faster training and lower memory usage
-    # This can speed up training by 1.5-2x on modern GPUs
     use_amp = args.use_amp and torch.cuda.is_available()
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     if use_amp:
@@ -1058,9 +583,9 @@ def train(args):
     if args.resume_from:
         if not os.path.exists(args.resume_from):
             raise FileNotFoundError(
-                f" Checkpoint file not found: {args.resume_from}\n"
+                f"❌ Checkpoint file not found: {args.resume_from}\n"
                 f"   Please check the path and try again.\n"
-                f"   Example checkpoint path: /content/drive/MyDrive/GANsHomework/cyclegan_checkpoints/resnet-baseline_epoch_5.pth"
+                f"   Example checkpoint path: /content/drive/MyDrive/GANsHomework/cyclegan_checkpoints/resnet-lsgan_epoch_5.pth"
             )
         start_epoch, exp_name, losses_history = load_checkpoint(
             args.resume_from,
@@ -1070,14 +595,12 @@ def train(args):
         )
         # Update experiment name if resuming
         if exp_name != args.experiment_name:
-            print(f"  Warning: Experiment name mismatch. Using checkpoint name: {exp_name}")
+            print(f"⚠️  Warning: Experiment name mismatch. Using checkpoint name: {exp_name}")
             args.experiment_name = exp_name
-        print(f" Resuming from epoch {start_epoch}, will train until epoch {args.epochs}")
+        print(f"✅ Resuming from epoch {start_epoch}, will train until epoch {args.epochs}")
     
     # ==================== Setup Image Output Directory ====================
-    # Save images for comparison across epochs (for your tutor's graphs!)
-    fixed_image_pairs_original = None  # Store original images for consistent comparison
-    # Set image save frequency (defaults to 1 if not specified, meaning every epoch)
+    fixed_image_pairs_original = None
     image_save_freq = args.image_save_freq
     
     if args.save_images:
@@ -1091,7 +614,7 @@ def train(args):
             print(f"   Images saved at epochs: every {image_save_freq} epochs")
         print(f"   Saving 5 fixed photo->painting pairs for consistent comparison")
         
-        # Get 5 fixed image pairs at the start (same images used across all epochs)
+        # Get 5 fixed image pairs at the start
         print("   Selecting 5 fixed image pairs...")
         fixed_image_pairs_original = []
         with torch.no_grad():
@@ -1100,7 +623,6 @@ def train(args):
             for batch_idx, (real_A, real_B) in enumerate(dataloader):
                 if batch_idx >= 5:
                     break
-                # Store original images (will regenerate transformations at each checkpoint)
                 fixed_image_pairs_original.append(real_A.to(device))
             gen_A2B.train()
             gen_B2A.train()
@@ -1109,6 +631,7 @@ def train(args):
     # ==================== Training Loop ====================
     print(f"   Starting training: {args.experiment_name}")
     print(f"   Architecture: {args.architecture}")
+    print(f"   Loss: LSGAN (Least Squares GAN)")
     print(f"   Epochs: {args.epochs} (starting from {start_epoch})")
     print(f"   Batch size: {args.batch_size}")
     print(f"   Checkpoint frequency: Every {args.checkpoint_freq} epochs")
@@ -1125,7 +648,7 @@ def train(args):
     current_experiment_name = args.experiment_name
     current_checkpoint_dir = args.checkpoint_dir
     
-    # Signal handler for graceful shutdown (Ctrl+C or disconnection)
+    # Signal handler for graceful shutdown
     def signal_handler(sig, frame):
         print("\n\n⚠️  Interruption detected! Saving checkpoint before exit...")
         try:
@@ -1142,7 +665,7 @@ def train(args):
             print(f"❌ Failed to save emergency checkpoint: {e}")
         sys.exit(0)
     
-    # Register signal handlers (works on Unix/Linux/Colab)
+    # Register signal handlers
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, signal_handler)
     if hasattr(signal, 'SIGINT'):
@@ -1152,7 +675,7 @@ def train(args):
         for epoch in range(start_epoch, args.epochs):
             current_epoch = epoch
             print(f"\n{'='*70}")
-            print(f"🎨 Epoch {epoch+1}/{args.epochs}")
+            print(f"🎨 Epoch {epoch+1}/{args.epochs} (LSGAN)")
             print(f"{'='*70}")
             epoch_start_time = time.time()
             
@@ -1171,7 +694,7 @@ def train(args):
                 })
                 current_losses_history = losses_history
                 
-                # Log epoch summary to WandB (with error handling)
+                # Log epoch summary to WandB
                 try:
                     log_dict = {f"epoch_loss/{k}": v for k, v in epoch_losses.items()}
                     log_dict['epoch'] = epoch
@@ -1179,14 +702,14 @@ def train(args):
                 except Exception as e:
                     print(f"Warning: WandB logging failed: {e}. Continuing...")
                 
-                # Log loss curves plot (with error handling)
+                # Log loss curves plot
                 if len(losses_history) > 1:
                     try:
                         plot_loss_curves(losses_history)
                     except Exception as e:
                         print(f"Warning: Loss curve plotting failed: {e}. Continuing...")
                 
-                # Log final image grid for epoch (with error handling)
+                # Log final image grid for epoch
                 try:
                     real_A, fake_B, rec_A, real_B, fake_A, rec_B = sample_images
                     log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, 
@@ -1196,10 +719,8 @@ def train(args):
                 
                 # Save 5 fixed image pairs for comparison across epochs
                 if args.save_images and fixed_image_pairs_original is not None:
-                    # Use image_save_freq (which defaults to checkpoint_freq if not set)
                     if (epoch + 1) % image_save_freq == 0 or (epoch + 1) == args.epochs:
                         try:
-                            # Regenerate transformations for the fixed pairs using current model
                             gen_A2B.eval()
                             gen_B2A.eval()
                             fixed_pairs_results = []
@@ -1211,7 +732,6 @@ def train(args):
                             gen_A2B.train()
                             gen_B2A.train()
                             
-                            # Save the 5 fixed pairs
                             save_fixed_image_pairs(fixed_pairs_results, epoch, args.experiment_name, args.image_output_dir)
                             print(f"     💾 Images saved for epoch {epoch+1}")
                         except Exception as e:
@@ -1227,17 +747,17 @@ def train(args):
                     except Exception as e:
                         print(f"     ⚠️  Warning: Evaluation failed: {e}. Continuing training...")
                 
-                # Save checkpoint every epoch as backup (quick recovery)
+                # Save checkpoint every epoch as backup
                 try:
                     save_checkpoint(
                         epoch, gen_A2B, gen_B2A, disc_A, disc_B,
                         optimizer_G, optimizer_D, losses_history,
                         args.checkpoint_dir, args.experiment_name,
-                        save_latest=True  # Always save latest.pth
+                        save_latest=True
                     )
                 except Exception as e:
                     print(f"ERROR: Failed to save backup checkpoint: {e}")
-                    raise  # Re-raise if checkpoint save fails
+                    raise
                 
                 # Save numbered checkpoint at specified frequency
                 if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
@@ -1246,11 +766,10 @@ def train(args):
                             epoch, gen_A2B, gen_B2A, disc_A, disc_B,
                             optimizer_G, optimizer_D, losses_history,
                             args.checkpoint_dir, args.experiment_name,
-                            save_latest=False  # Don't duplicate latest save
+                            save_latest=False
                         )
                     except Exception as e:
                         print(f"ERROR: Failed to save numbered checkpoint: {e}")
-                        # Don't raise - we already have latest.pth
                 
                 epoch_time = time.time() - epoch_start_time
                 mins, secs = divmod(int(epoch_time), 60)
@@ -1264,13 +783,13 @@ def train(args):
                 
             except KeyboardInterrupt:
                 print("\n\n⚠️  Training interrupted by user!")
-                raise  # Re-raise to trigger signal handler
+                raise
             except Exception as e:
                 print(f"\n\n❌ Error during epoch {epoch+1}: {e}")
                 print("Attempting to save emergency checkpoint...")
                 try:
                     save_checkpoint(
-                        epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
+                        epoch, gen_A2B, gen_B2A, disc_A, disc_B,
                         optimizer_G, optimizer_D, losses_history,
                         args.checkpoint_dir, args.experiment_name,
                         save_latest=True
@@ -1278,26 +797,25 @@ def train(args):
                     print("✅ Emergency checkpoint saved! You can resume training.")
                 except Exception as save_error:
                     print(f"❌ Failed to save emergency checkpoint: {save_error}")
-                raise  # Re-raise the original error
+                raise
         
         print("\n✅ Training completed!")
         
     except KeyboardInterrupt:
-        # Signal handler will save checkpoint
         pass
     except Exception as e:
         print(f"\n❌ Training failed with error: {e}")
         print("Attempting final emergency checkpoint save...")
         try:
             save_checkpoint(
-                current_epoch + 1, gen_A2B, gen_B2A, disc_A, disc_B,
+                current_epoch, gen_A2B, gen_B2A, disc_A, disc_B,
                 optimizer_G, optimizer_D, losses_history,
                 args.checkpoint_dir, args.experiment_name,
                 save_latest=True
             )
-            print(" Final checkpoint saved!")
+            print("✅ Final checkpoint saved!")
         except:
-            print(" Failed to save final checkpoint")
+            print("❌ Failed to save final checkpoint")
         raise
     finally:
         try:
@@ -1307,7 +825,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CycleGAN with WandB")
+    parser = argparse.ArgumentParser(description="Train CycleGAN with LSGAN Loss and WandB")
     
     # Data arguments
     parser.add_argument("--data_A", type=str, required=True,
@@ -1343,11 +861,11 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Path to checkpoint to resume from")
     
-    # Image saving arguments (for comparison and visualization)
+    # Image saving arguments
     parser.add_argument("--save_images", action="store_true", default=True,
                        help="Save generated images to disk for comparison across epochs (default: True)")
     parser.add_argument("--image_output_dir", type=str, default=None,
-                       help="Base directory to save generated images (default: checkpoint_dir/images/experiment_name). Images are organized by epoch in subdirectories.")
+                       help="Base directory to save generated images (default: checkpoint_dir/images/experiment_name)")
     parser.add_argument("--image_save_freq", type=int, default=1,
                        help="Save images every N epochs (default: 1, meaning every epoch)")
     
@@ -1361,8 +879,9 @@ if __name__ == "__main__":
     parser.add_argument("--project_name", type=str, default="cyclegan-experiments",
                        help="WandB project name")
     parser.add_argument("--experiment_name", type=str, required=True,
-                       help="Experiment name (e.g., 'resnet-baseline')")
+                       help="Experiment name (e.g., 'resnet-lsgan')")
     
     args = parser.parse_args()
     
     train(args)
+
