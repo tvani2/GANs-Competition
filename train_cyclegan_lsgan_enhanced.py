@@ -165,8 +165,9 @@ def train_epoch_enhanced(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         epoch_losses['gen_adv'] += gen_losses['adversarial'].item()
         epoch_losses['gen_cycle'] += gen_losses['cycle'].item()
         epoch_losses['gen_identity'] += gen_losses['identity'].item()
-        epoch_losses['gen_edge'] += gen_losses['edge'].item()      # NEW
-        epoch_losses['gen_freq'] += gen_losses['freq'].item()      # NEW
+        # Edge and freq losses might be 0.0 (float) or tensor
+        epoch_losses['gen_edge'] += gen_losses['edge'].item() if isinstance(gen_losses['edge'], torch.Tensor) else gen_losses['edge']
+        epoch_losses['gen_freq'] += gen_losses['freq'].item() if isinstance(gen_losses['freq'], torch.Tensor) else gen_losses['freq']
         epoch_losses['disc_A'] += disc_A_loss.item()
         epoch_losses['disc_B'] += disc_B_loss.item()
         
@@ -179,13 +180,15 @@ def train_epoch_enhanced(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         )
         
         if show_detailed_progress and step > 0:
+            edge_val = gen_losses['edge'].item() if isinstance(gen_losses['edge'], torch.Tensor) else gen_losses['edge']
+            freq_val = gen_losses['freq'].item() if isinstance(gen_losses['freq'], torch.Tensor) else gen_losses['freq']
             print(f"\r  Batch [{step+1:4d}/{num_batches:4d}] - "
                   f"G_loss: {gen_total.item():.4f} "
                   f"(adv: {gen_losses['adversarial'].item():.4f}, "
                   f"cyc: {gen_losses['cycle'].item():.4f}, "
                   f"id: {gen_losses['identity'].item():.4f}, "
-                  f"edge: {gen_losses['edge'].item():.4f}, "
-                  f"freq: {gen_losses['freq'].item():.4f}) | "
+                  f"edge: {edge_val:.4f}, "
+                  f"freq: {freq_val:.4f}) | "
                   f"D_loss: {(disc_A_loss.item() + disc_B_loss.item())/2:.4f}")
             last_progress_time = current_time
         
@@ -195,13 +198,15 @@ def train_epoch_enhanced(gen_A2B, gen_B2A, disc_A, disc_B, dataloader,
         
         if step % log_freq == 0:
             try:
+                edge_val = gen_losses['edge'].item() if isinstance(gen_losses['edge'], torch.Tensor) else gen_losses['edge']
+                freq_val = gen_losses['freq'].item() if isinstance(gen_losses['freq'], torch.Tensor) else gen_losses['freq']
                 wandb.log({
                     "loss/gen_total": gen_total.item(),
                     "loss/gen_adv": gen_losses['adversarial'].item(),
                     "loss/gen_cycle": gen_losses['cycle'].item(),
                     "loss/gen_identity": gen_losses['identity'].item(),
-                    "loss/gen_edge": gen_losses['edge'].item(),      # NEW
-                    "loss/gen_freq": gen_losses['freq'].item(),      # NEW
+                    "loss/gen_edge": edge_val,
+                    "loss/gen_freq": freq_val,
                     "loss/disc_A": disc_A_loss.item(),
                     "loss/disc_B": disc_B_loss.item(),
                     "epoch": epoch,
