@@ -43,9 +43,9 @@ class EdgeSoftnessLoss(nn.Module):
     
     def compute_edge_strength(self, gray_image):
         """Compute Sobel edge strength"""
-        # Ensure Sobel filters match input dtype
-        sobel_x = self.sobel_x.to(dtype=gray_image.dtype)
-        sobel_y = self.sobel_y.to(dtype=gray_image.dtype)
+        # Ensure Sobel filters match input dtype and device
+        sobel_x = self.sobel_x.to(dtype=gray_image.dtype, device=gray_image.device)
+        sobel_y = self.sobel_y.to(dtype=gray_image.dtype, device=gray_image.device)
         
         gx = F.conv2d(gray_image, sobel_x, padding=1)
         gy = F.conv2d(gray_image, sobel_y, padding=1)
@@ -97,7 +97,7 @@ class HighFreqSuppressionLoss(nn.Module):
         
         for i in range(batch_size):
             # Convert to float32 for numpy operations, then back to original dtype
-            img = gray_image[i, 0].float().cpu().numpy()
+            img = gray_image[i, 0].float().detach().cpu().numpy()
             
             # Compute 2D FFT
             fft = np.fft.fft2(img)
