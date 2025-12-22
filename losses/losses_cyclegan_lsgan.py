@@ -226,4 +226,3 @@ if __name__ == "__main__":
     print("\nUsage:")
     print("  from losses_cyclegan_lsgan import CycleGANLossesLSGAN")
     print("  losses = CycleGANLossesLSGAN(lambda_cycle=10.0, lambda_identity=0.5)")
-

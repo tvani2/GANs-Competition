@@ -1060,7 +1060,16 @@ def train(args):
     # num_workers: Use 4-8 for better parallelization (adjust based on CPU cores)
     # pin_memory: Faster GPU transfer when using CUDA
     # persistent_workers: Keep workers alive between epochs to avoid recreation overhead
-    num_workers = min(8, os.cpu_count() or 4)  # Use up to 8 workers, or CPU count if less
+    # On CPU or when resuming, use fewer workers to avoid OOM
+    if args.num_workers is not None:
+        num_workers = args.num_workers
+    else:
+        # Auto-detect: use fewer workers on CPU or when resuming
+        if not torch.cuda.is_available():
+            num_workers = 0 if args.resume_from else 2  # 0 workers on CPU when resuming
+        else:
+            num_workers = min(8, os.cpu_count() or 4)
+    
     dataloader = DataLoader(
         dataset, 
         batch_size=args.batch_size, 
@@ -1068,7 +1077,7 @@ def train(args):
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
         persistent_workers=num_workers > 0,  # Keep workers alive between epochs
-        prefetch_factor=2 if num_workers > 0 else 2  # Prefetch batches
+        prefetch_factor=2 if num_workers > 0 else None  # Prefetch batches
     )
     
     # ==================== Initialize Models ====================
@@ -1387,6 +1396,8 @@ if __name__ == "__main__":
                        help="Batch size")
     parser.add_argument("--lr", type=float, default=0.0002,
                        help="Learning rate")
+    parser.add_argument("--num_workers", type=int, default=None,
+                       help="Number of DataLoader workers (default: auto-detect, 0 on CPU when resuming)")
     parser.add_argument("--lambda_cycle", type=float, default=10.0,
                        help="Weight for cycle consistency loss")
     parser.add_argument("--lambda_identity", type=float, default=0.5,

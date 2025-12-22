@@ -526,7 +526,16 @@ def train(args):
     
     dataset = ImageDataset(args.data_A, args.data_B, transform=transform)
     # Optimize DataLoader for faster data loading
-    num_workers = min(8, os.cpu_count() or 4)
+    # On CPU or when resuming, use fewer workers to avoid OOM
+    if args.num_workers is not None:
+        num_workers = args.num_workers
+    else:
+        # Auto-detect: use fewer workers on CPU or when resuming
+        if not torch.cuda.is_available():
+            num_workers = 0 if args.resume_from else 2  # 0 workers on CPU when resuming
+        else:
+            num_workers = min(8, os.cpu_count() or 4)
+    
     dataloader = DataLoader(
         dataset, 
         batch_size=args.batch_size, 
@@ -534,18 +543,18 @@ def train(args):
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else 2
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     # ==================== Initialize Models ====================
     if args.architecture == 'resnet':
         gen_A2B = ResNetGenerator(input_nc=3, output_nc=3, ngf=64, n_blocks=9).to(device)
         gen_B2A = ResNetGenerator(input_nc=3, output_nc=3, ngf=64, n_blocks=9).to(device)
-    # elif args.architecture == 'unet':
-    #     gen_A2B = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
-    #     gen_B2A = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
+    elif args.architecture == 'unet':
+        gen_A2B = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
+        gen_B2A = UNetGenerator(input_nc=3, output_nc=3, ngf=64).to(device)
     else:
-        raise ValueError(f"Unknown architecture: {args.architecture}. Only 'resnet' is currently supported.")
+        raise ValueError(f"Unknown architecture: {args.architecture}")
     
     disc_A = PatchGANDiscriminator(input_nc=3, ndf=64).to(device)
     disc_B = PatchGANDiscriminator(input_nc=3, ndf=64).to(device)
@@ -845,6 +854,8 @@ if __name__ == "__main__":
                        help="Batch size")
     parser.add_argument("--lr", type=float, default=0.0002,
                        help="Learning rate")
+    parser.add_argument("--num_workers", type=int, default=None,
+                       help="Number of DataLoader workers (default: auto-detect, 0 on CPU when resuming)")
     parser.add_argument("--lambda_cycle", type=float, default=10.0,
                        help="Weight for cycle consistency loss")
     parser.add_argument("--lambda_identity", type=float, default=0.5,
