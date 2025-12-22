@@ -60,11 +60,12 @@ class EdgeSoftnessLoss(nn.Module):
             generated: Generated Monet images (B, 3, H, W) in [-1, 1]
             target: Real Monet images (B, 3, H, W) in [-1, 1]
         """
-        # Convert to grayscale
-        gray_gen = 0.299 * generated[:, 0:1] + 0.587 * generated[:, 1:2] + 0.114 * generated[:, 2:3]
+        # Convert to grayscale (ensure dtype compatibility)
+        dtype = generated.dtype
+        gray_gen = (generated[:, 0:1] * 0.299 + generated[:, 1:2] * 0.587 + generated[:, 2:3] * 0.114).to(dtype)
         gray_gen = (gray_gen + 1.0) / 2.0  # Normalize to [0, 1]
         
-        gray_target = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
+        gray_target = (target[:, 0:1] * 0.299 + target[:, 1:2] * 0.587 + target[:, 2:3] * 0.114).to(dtype)
         gray_target = (gray_target + 1.0) / 2.0
         
         edge_gen = self.compute_edge_strength(gray_gen)
@@ -128,11 +129,12 @@ class HighFreqSuppressionLoss(nn.Module):
             generated: Generated Monet images (B, 3, H, W) in [-1, 1]
             target: Real Monet images (B, 3, H, W) in [-1, 1]
         """
-        # Convert to grayscale
-        gray_gen = 0.299 * generated[:, 0:1] + 0.587 * generated[:, 1:2] + 0.114 * generated[:, 2:3]
+        # Convert to grayscale (ensure dtype compatibility)
+        dtype = generated.dtype
+        gray_gen = (generated[:, 0:1] * 0.299 + generated[:, 1:2] * 0.587 + generated[:, 2:3] * 0.114).to(dtype)
         gray_gen = (gray_gen + 1.0) / 2.0
         
-        gray_target = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
+        gray_target = (target[:, 0:1] * 0.299 + target[:, 1:2] * 0.587 + target[:, 2:3] * 0.114).to(dtype)
         gray_target = (gray_target + 1.0) / 2.0
         
         psd_gen = self.compute_high_freq_psd(gray_gen)
