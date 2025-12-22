@@ -278,8 +278,8 @@ def log_image_grid(real_A, fake_B, rec_A, real_B, fake_A, rec_B, epoch, step,
 
 # Import shared functions
 import sys
-sys.path.insert(0, os.path.dirname(__file__))
-from train_cyclegan import (
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts.train_cyclegan import (
     save_checkpoint,
     load_checkpoint,
     plot_loss_curves,

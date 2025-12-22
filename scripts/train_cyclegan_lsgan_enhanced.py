@@ -11,8 +11,8 @@ Based on Epoch 40 analysis.
 import os
 import sys
 
-# Add current directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import torch
@@ -36,7 +36,7 @@ from models import ResNetGenerator, PatchGANDiscriminator
 from losses.losses_cyclegan_lsgan_enhanced import EnhancedCycleGANLossesLSGAN
 
 # Import shared functions from original training script
-from train_cyclegan import (
+from scripts.train_cyclegan import (
     ImageDataset,
     tensor_to_image,
     save_checkpoint,

@@ -9,6 +9,7 @@ This script trains CycleGAN models with:
 """
 
 import os
+import sys
 import argparse
 import torch
 import torch.optim as optim
@@ -23,10 +24,12 @@ import matplotlib.pyplot as plt
 # Configure matplotlib to prevent too many open figures warning
 plt.rcParams['figure.max_open_warning'] = 0
 import signal
-import sys
 import time
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import your models and losses
 from models import ResNetGenerator, PatchGANDiscriminator
