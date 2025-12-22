@@ -33,7 +33,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 
 # Import models and ENHANCED losses
 from models import ResNetGenerator, PatchGANDiscriminator
-from losses.losses_cyclegan_lsgan_enhanced_final import EnhancedCycleGANLossesLSGAN
+from losses.losses_cyclegan_lsgan_enhanced import EnhancedCycleGANLossesLSGAN
 
 # Import shared functions from original training script
 from train_cyclegan import (
