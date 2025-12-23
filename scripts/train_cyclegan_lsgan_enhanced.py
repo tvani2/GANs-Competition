@@ -321,6 +321,34 @@ def train_enhanced(args):
         )
         print(f"✅ Resuming from epoch {start_epoch}")
     
+    # ==================== Setup Image Output Directory ====================
+    # Save images for comparison across epochs (photo -> painting -> photo cycle)
+    fixed_image_pairs_original = None  # Store original images for consistent comparison
+    image_save_freq = args.image_save_freq
+    
+    if args.save_images:
+        if args.image_output_dir is None:
+            args.image_output_dir = os.path.join(args.checkpoint_dir, "images", args.experiment_name)
+        os.makedirs(args.image_output_dir, exist_ok=True)
+        print(f"   Images will be saved to: {args.image_output_dir}")
+        print(f"   Images saved: every {image_save_freq} epochs")
+        print(f"   Saving 5 fixed photo->painting->photo pairs for consistent comparison")
+        
+        # Get 5 fixed image pairs at the start (same images used across all epochs)
+        print("   Selecting 5 fixed image pairs...")
+        fixed_image_pairs_original = []
+        with torch.no_grad():
+            gen_A2B.eval()
+            gen_B2A.eval()
+            for batch_idx, (real_A, real_B) in enumerate(dataloader):
+                if batch_idx >= 5:
+                    break
+                # Store original images (will regenerate transformations at each checkpoint)
+                fixed_image_pairs_original.append(real_A.to(device))
+            gen_A2B.train()
+            gen_B2A.train()
+        print(f"   ✅ Selected 5 fixed image pairs for consistent comparison")
+    
     # Training loop
     print(f"\n{'='*70}")
     print(f"🎨 Starting Enhanced LSGAN Training")
@@ -375,6 +403,28 @@ def train_enhanced(args):
                     )
                 except Exception as e:
                     print(f"ERROR: Failed to save numbered checkpoint: {e}")
+            
+            # Save 5 fixed image pairs for comparison across epochs
+            if args.save_images and fixed_image_pairs_original is not None:
+                if (epoch + 1) % image_save_freq == 0 or (epoch + 1) == args.epochs:
+                    try:
+                        # Regenerate transformations for the fixed pairs using current model
+                        gen_A2B.eval()
+                        gen_B2A.eval()
+                        fixed_pairs_results = []
+                        with torch.no_grad():
+                            for real_A_fixed in fixed_image_pairs_original:
+                                fake_B_fixed = gen_A2B(real_A_fixed)
+                                rec_A_fixed = gen_B2A(fake_B_fixed)
+                                fixed_pairs_results.append((real_A_fixed, fake_B_fixed, rec_A_fixed))
+                        gen_A2B.train()
+                        gen_B2A.train()
+                        
+                        # Save the 5 fixed pairs
+                        save_fixed_image_pairs(fixed_pairs_results, epoch, args.experiment_name, args.image_output_dir)
+                        print(f"     💾 Images saved for epoch {epoch+1}")
+                    except Exception as e:
+                        print(f"     ⚠️  Warning: Failed to save fixed image pairs: {e}. Continuing...")
             
             epoch_time = time.time() - epoch_start_time
             mins, secs = divmod(int(epoch_time), 60)
